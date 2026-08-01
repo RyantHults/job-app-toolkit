@@ -1,0 +1,147 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 12px;
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #111827;
+  background: #ffffff;
+}
+
+h1 {
+  font-size: 16px;
+  margin: 0 0 8px 0;
+}
+
+h2 {
+  font-size: 13px;
+  margin: 0 0 8px 0;
+  color: #374151;
+}
+
+.section {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.label {
+  font-size: 13px;
+  color: #374151;
+  white-space: nowrap;
+}
+
+#profile-select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #f9fafb;
+  font-size: 13px;
+}
+
+.btn {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #f9fafb;
+  color: #111827;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: #f3f4f6;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.btn-primary {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+
+.btn-primary:hover {
+  background: #1d4ed8;
+}
+
+.btn-sm {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+#fields-list {
+  list-style: none;
+  margin: 0 0 8px 0;
+  padding: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.field-row:last-child {
+  border-bottom: none;
+}
+
+.field-name {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: #374151;
+}
+
+.field-name::after {
+  content: ":";
+  margin-left: 2px;
+}
+
+.field-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #111827;
+}
+
+.field-del {
+  flex-shrink: 0;
+}
+
+.status {
+  margin: 0;
+  font-style: italic;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.empty {
+  font-style: italic;
+  color: #9ca3af;
+}

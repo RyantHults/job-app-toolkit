@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+  <script src="popup.js" defer></script>
+  <title>Form Filler</title>
+</head>
+<body>
+  <h1>Form Filler</h1>
+
+  <!-- Active profile selection + fill action -->
+  <section class="section" aria-label="Profile and fill">
+    <div class="row">
+      <label for="profile-select" class="label">Profile</label>
+      <select id="profile-select" aria-label="Active profile"></select>
+      <button type="button" id="fill-btn" class="btn btn-primary">Fill Page</button>
+    </div>
+  </section>
+
+  <!-- Fields of the active profile -->
+  <section class="section" aria-label="Active profile fields">
+    <h2>Active Profile Fields</h2>
+    <ul id="fields-list"></ul>
+    <button type="button" id="add-field-btn" class="btn">+ Add Current Field</button>
+  </section>
+
+  <!-- Profile management -->
+  <section class="section" aria-label="Profiles">
+    <h2>Profiles</h2>
+    <div class="row">
+      <button type="button" id="new-profile-btn" class="btn">+ New</button>
+      <button type="button" id="rename-profile-btn" class="btn">Rename</button>
+      <button type="button" id="delete-profile-btn" class="btn">Delete</button>
+    </div>
+  </section>
+
+  <!-- Status / result line -->
+  <p id="status" class="status" aria-live="polite"></p>
+</body>
+</html>

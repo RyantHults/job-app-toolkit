@@ -1,0 +1,8 @@
+{
+  "manifest_version": 2,
+  "name": "Form Filler",
+  "version": "0.1.0",
+  "browser_action": {
+    "default_popup": "test_popup.html"
+  }
+}
