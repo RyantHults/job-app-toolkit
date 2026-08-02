@@ -1,34 +1,41 @@
 (() => {
   "use strict";
 
-  const STORAGE_KEY = "formFillerData";
+  const MODULE_ID = "form-filler";
 
+  const storage = window.jobAppToolkit.storage;
+  const ui = window.jobAppToolkit.ui;
+
+  const activeToggle = document.getElementById("active-toggle");
   const profileSelect = document.getElementById("profile-select");
   const fillBtn = document.getElementById("fill-btn");
   const addFieldBtn = document.getElementById("add-field-btn");
+  const addAllFieldsBtn = document.getElementById("add-all-fields-btn");
   const fieldsList = document.getElementById("fields-list");
   const newProfileBtn = document.getElementById("new-profile-btn");
   const renameProfileBtn = document.getElementById("rename-profile-btn");
   const deleteProfileBtn = document.getElementById("delete-profile-btn");
-  const statusEl = document.getElementById("status");
 
-  let data = { profiles: {}, activeProfile: null };
+  let data = { active: true, profiles: {}, activeProfile: null };
 
   // ---- Storage ---------------------------------------------------------------
 
   async function loadData() {
-    const result = await browser.storage.sync.get(STORAGE_KEY);
-    data = result[STORAGE_KEY] || { profiles: {}, activeProfile: null };
+    data = await storage.getModuleData(MODULE_ID);
     if (!data.profiles || typeof data.profiles !== "object") {
       data.profiles = {};
     }
     if (!data.activeProfile || !(data.activeProfile in data.profiles)) {
       data.activeProfile = Object.keys(data.profiles)[0] || null;
     }
+    activeToggle.checked = data.active === true;
   }
 
   function saveData() {
-    return browser.storage.sync.set({ [STORAGE_KEY]: data });
+    return storage.setModuleData(MODULE_ID, {
+      profiles: data.profiles,
+      activeProfile: data.activeProfile
+    });
   }
 
   // ---- Small helpers ----------------------------------------------------------
@@ -45,18 +52,9 @@
     return Object.prototype.hasOwnProperty.call(data.profiles, name);
   }
 
-  function setStatus(msg) {
-    statusEl.textContent = msg;
-  }
-
-  async function getActiveTab() {
-    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    return tabs[0] || null;
-  }
-
   function handleError(err) {
-    console.error("Form Filler popup error:", err);
-    setStatus("Something went wrong");
+    console.error("Form Filler options error:", err);
+    ui.setStatus("Something went wrong");
   }
 
   // ---- Rendering --------------------------------------------------------------
@@ -104,14 +102,18 @@
       return;
     }
 
-    for (const [name, value] of entries) {
+    for (const [key, entry] of entries) {
+      const isObj = entry && typeof entry === "object";
+      const value = isObj ? entry.value : entry;
+      const label = isObj && entry.label ? entry.label : key;
+
       const li = document.createElement("li");
       li.className = "field-row";
 
       const nameSpan = document.createElement("span");
       nameSpan.className = "field-name";
-      nameSpan.textContent = name;
-      nameSpan.title = name;
+      nameSpan.textContent = label;
+      nameSpan.title = label;
 
       const valueSpan = document.createElement("span");
       valueSpan.className = "field-value";
@@ -122,10 +124,17 @@
       del.type = "button";
       del.className = "btn btn-sm field-del";
       del.textContent = "Del";
-      del.addEventListener("click", () => deleteField(name));
+      del.addEventListener("click", () => deleteField(key));
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "btn btn-sm field-edit";
+      editBtn.textContent = "Edit";
+      editBtn.addEventListener("click", () => editFieldLabel(key));
 
       li.appendChild(nameSpan);
       li.appendChild(valueSpan);
+      li.appendChild(editBtn);
       li.appendChild(del);
       fieldsList.appendChild(li);
     }
@@ -152,113 +161,129 @@
   async function deleteField(name) {
     const profile = currentProfile();
     if (!profile) return;
-    if (!window.confirm('Delete field "' + name + '"?')) return;
+    if (!(await ui.showConfirm('Delete field "' + name + '"?'))) return;
     delete profile.fields[name];
     await saveData();
     render();
   }
 
+  async function editFieldLabel(key) {
+    const profile = currentProfile();
+    if (!profile || !Object.prototype.hasOwnProperty.call(profile.fields, key)) return;
+    const entry = profile.fields[key];
+    const isObj = entry && typeof entry === "object";
+    const currentLabel = isObj && entry.label ? entry.label : key;
+
+    const raw = await ui.showPrompt("Field title:", currentLabel);
+    if (raw === null) return;
+    const label = raw.trim();
+    if (!label) return;
+
+    if (isObj) {
+      entry.label = label;
+    } else {
+      // Legacy string entry — promote to the { value, label } format.
+      profile.fields[key] = { value: entry, label: label };
+    }
+    await saveData();
+    render();
+    ui.setStatus("Field title updated.");
+  }
+
   // ---- Handlers ---------------------------------------------------------------
+
+  activeToggle.addEventListener("change", async () => {
+    try {
+      await storage.setModuleActive(MODULE_ID, activeToggle.checked);
+      data.active = activeToggle.checked;
+      ui.setStatus(activeToggle.checked ? "Module active." : "Module inactive.");
+    } catch (err) {
+      handleError(err);
+    }
+  });
 
   profileSelect.addEventListener("change", () => {
     setActiveProfile(profileSelect.value).catch(handleError);
   });
 
   fillBtn.addEventListener("click", async () => {
-    const profile = currentProfile();
-    if (!profile) {
-      setStatus("No active profile.");
+    if (!currentProfile()) {
+      ui.setStatus("No active profile.");
       return;
     }
     try {
-      const tab = await getActiveTab();
-      if (!tab) {
-        setStatus("No active tab found.");
-        return;
+      const res = await browser.runtime.sendMessage({ type: "form-filler:fillPageRequest" });
+      if (res && res.ok) {
+        ui.setStatus(res.message || "Done.");
+      } else {
+        ui.setStatus((res && res.error) || "Cannot fill this page.");
       }
-      const response = await browser.tabs.sendMessage(tab.id, {
-        type: "fillPage",
-        activeProfile: { fields: profile.fields || {} },
-      });
-      let msg = "Filled " + response.filled + ", skipped " + response.skipped;
-      if (response.unmatched) {
-        msg += ", unmatched " + response.unmatched;
-      }
-      setStatus(msg);
     } catch (err) {
-      setStatus("Cannot fill this page");
+      ui.setStatus("Cannot fill this page.");
     }
   });
 
   addFieldBtn.addEventListener("click", async () => {
-    const profile = currentProfile();
-    if (!profile) {
-      setStatus("No active profile.");
+    if (!currentProfile()) {
+      ui.setStatus("No active profile.");
       return;
     }
-    let tab;
-    let field;
     try {
-      tab = await getActiveTab();
-      if (!tab) {
-        setStatus("No active tab found.");
-        return;
+      const res = await browser.runtime.sendMessage({ type: "form-filler:captureFieldRequest" });
+      if (res && res.ok) {
+        ui.setStatus(res.message || "Field captured.");
+        render();
+      } else {
+        ui.setStatus((res && res.error) || "Could not capture the current field.");
       }
-      field = await browser.tabs.sendMessage(tab.id, { type: "getFocusedField" });
     } catch (err) {
-      setStatus("Cannot read the current page");
+      ui.setStatus("Could not capture the current field.");
+    }
+  });
+
+  addAllFieldsBtn.addEventListener("click", async () => {
+    if (!currentProfile()) {
+      ui.setStatus("No active profile.");
       return;
     }
-    if (!field || !field.name) {
-      setStatus("No focused form field detected");
-      return;
-    }
-
-    const name = window.prompt("Field name:", field.name);
-    if (name === null) return;
-    const trimmedName = name.trim();
-    if (!trimmedName) return;
-
-    const value = window.prompt("Value to save:", field.value !== undefined ? field.value : "");
-    if (value === null) return;
-
-    profile.fields = profile.fields || {};
-    if (Object.prototype.hasOwnProperty.call(profile.fields, trimmedName)) {
-      if (!window.confirm('Field "' + trimmedName + '" already exists. Overwrite it?')) {
-        return;
+    try {
+      const res = await browser.runtime.sendMessage({ type: "form-filler:collectAllRequest" });
+      if (res && res.ok) {
+        ui.setStatus(res.message || "Fields added.");
+        render();
+      } else {
+        ui.setStatus((res && res.error) || "Could not read the current page.");
       }
+    } catch (err) {
+      ui.setStatus("Could not read the current page.");
     }
-    profile.fields[trimmedName] = value;
-    await saveData();
-    render();
-    setStatus('Added field "' + trimmedName + '".');
   });
 
   newProfileBtn.addEventListener("click", async () => {
-    const raw = window.prompt("New profile name:");
+    const raw = await ui.showPrompt("New profile name:");
     if (raw === null) return;
     const name = raw.trim();
     if (!name) return;
     if (isDuplicateProfile(name)) {
-      window.alert("A profile with that name already exists.");
+      ui.setStatus("A profile with that name already exists.");
       return;
     }
     data.profiles[name] = { fields: {} };
     data.activeProfile = name;
     await saveData();
     render();
-    setStatus('Profile "' + name + '" created.');
+    ui.setStatus('Profile "' + name + '" created.');
   });
 
   renameProfileBtn.addEventListener("click", async () => {
     const oldName = data.activeProfile;
     if (!oldName) return;
-    const raw = window.prompt('New name for profile "' + oldName + '":', oldName);
+    const raw = await ui.showPrompt('New name for profile "' + oldName + '":', oldName);
     if (raw === null) return;
     const name = raw.trim();
     if (!name || name === oldName) return;
     if (isDuplicateProfile(name)) {
-      window.alert("A profile with that name already exists.");
+      ui.setStatus("A profile with that name already exists.");
       return;
     }
     data.profiles[name] = data.profiles[oldName];
@@ -266,13 +291,13 @@
     data.activeProfile = name;
     await saveData();
     render();
-    setStatus('Profile renamed to "' + name + '".');
+    ui.setStatus('Profile renamed to "' + name + '".');
   });
 
   deleteProfileBtn.addEventListener("click", async () => {
     const name = data.activeProfile;
     if (!name) return;
-    if (!window.confirm('Delete profile "' + name + '"?')) return;
+    if (!(await ui.showConfirm('Delete profile "' + name + '"?'))) return;
     delete data.profiles[name];
     const remaining = profileNames();
     data.activeProfile = remaining.length ? remaining[0] : null;
@@ -282,7 +307,5 @@
 
   // ---- Init -------------------------------------------------------------------
 
-  // The script is loaded with `defer`, so by the time it runs the DOM is
-  // already parsed and DOMContentLoaded has already fired. Call init directly.
   loadData().then(render).catch(handleError);
 })();

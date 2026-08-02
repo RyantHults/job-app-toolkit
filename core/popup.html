@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+  <title>Job App Toolkit</title>
+</head>
+<body>
+  <h1>Job App Toolkit</h1>
+  <p class="subtitle">Modules</p>
+
+  <!-- Module control center: populated by popup.js from the background registry -->
+  <div id="modules-list" role="list"></div>
+
+  <!-- Status / result line -->
+  <p id="status" class="status" aria-live="polite"></p>
+
+  <!-- Inline modal overlay -->
+  <div id="modal-overlay" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="modal-input" type="text" hidden />
+      <div class="modal-actions">
+        <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="modal-confirm" class="btn btn-primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="storage.js"></script>
+  <script src="ui.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
