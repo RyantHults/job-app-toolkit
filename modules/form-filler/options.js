@@ -12,11 +12,15 @@
   const addFieldBtn = document.getElementById("add-field-btn");
   const addAllFieldsBtn = document.getElementById("add-all-fields-btn");
   const fieldsList = document.getElementById("fields-list");
+  const fieldSearch = document.getElementById("field-search");
   const newProfileBtn = document.getElementById("new-profile-btn");
   const renameProfileBtn = document.getElementById("rename-profile-btn");
   const deleteProfileBtn = document.getElementById("delete-profile-btn");
 
   let data = { active: true, profiles: {}, activeProfile: null };
+
+  // Search event listener
+  fieldSearch.addEventListener("input", filterFields);
 
   // ---- Storage ---------------------------------------------------------------
 
@@ -55,6 +59,82 @@
   function handleError(err) {
     console.error("Form Filler options error:", err);
     ui.setStatus("Something went wrong");
+  }
+
+  // ---- Search helpers ---------------------------------------------------------
+  // Mirrors content.js matching logic so the options page and fill logic agree.
+
+  function normalize(str) {
+    return String(str == null ? "" : str)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function entryNorms(entry, key) {
+    const isObj = entry && typeof entry === "object";
+    const label = isObj && entry.label ? entry.label : key;
+    const keyNorm = normalize(key);
+    const labelNorm = normalize(label);
+    const norms = [];
+    if (keyNorm) norms.push(keyNorm);
+    if (labelNorm && labelNorm !== keyNorm) norms.push(labelNorm);
+    return norms;
+  }
+
+  function matchScore(queryNorm, norms) {
+    if (!queryNorm) return 0;
+    let best = 0;
+    for (const norm of norms) {
+      if (norm === queryNorm) {
+        best = 100;
+      } else if (norm.startsWith(queryNorm) || queryNorm.startsWith(norm)) {
+        const r = Math.min(norm.length, queryNorm.length) / Math.max(norm.length, queryNorm.length);
+        best = Math.max(best, Math.round(80 + 19 * r));
+      } else if (norm.includes(queryNorm) || queryNorm.includes(norm)) {
+        const shorter = norm.length < queryNorm.length ? norm : queryNorm;
+        const longer = norm.length >= queryNorm.length ? norm : queryNorm;
+        const r = shorter.length / longer.length;
+        best = Math.max(best, Math.round(40 + 39 * r));
+      } else {
+        const set1 = new Set(norm), set2 = new Set(queryNorm);
+        const inter = [...set1].filter(x => set2.has(x)).length;
+        const union = new Set([...set1, ...set2]).size;
+        best = Math.max(best, Math.round((inter / union) * 40));
+      }
+    }
+    return best;
+  }
+
+  function filterFields() {
+    const q = normalize(fieldSearch.value);
+    const rows = fieldsList.querySelectorAll(".field-row");
+    const profile = currentProfile();
+    if (!profile) return;
+
+    // Empty search: show all rows with no highlight
+    if (!q) {
+      rows.forEach(row => {
+        row.classList.remove("hidden");
+        row.style.setProperty("--match-opacity", 0);
+      });
+      return;
+    }
+
+    rows.forEach(row => {
+      const key = row.dataset.key;
+      const entry = profile.fields[key];
+      const norms = entryNorms(entry, key);
+      const score = matchScore(q, norms);
+
+      if (score >= 1) {
+        row.classList.remove("hidden");
+        row.style.setProperty("--match-opacity", score / 100);
+      } else {
+        row.classList.add("hidden");
+        row.style.setProperty("--match-opacity", 0);
+      }
+    });
   }
 
   // ---- Rendering --------------------------------------------------------------
@@ -109,6 +189,7 @@
 
       const li = document.createElement("li");
       li.className = "field-row";
+      li.dataset.key = key;
 
       const nameSpan = document.createElement("span");
       nameSpan.className = "field-name";
@@ -148,6 +229,7 @@
     addFieldBtn.disabled = !hasProfile;
     renameProfileBtn.disabled = !hasProfile;
     deleteProfileBtn.disabled = !hasProfile;
+    filterFields();
   }
 
   // ---- Actions ----------------------------------------------------------------
@@ -307,5 +389,9 @@
 
   // ---- Init -------------------------------------------------------------------
 
-  loadData().then(render).catch(handleError);
+  loadData().then(() => {
+    fieldSearch.value = "";
+    filterFields();
+    render();
+  }).catch(handleError);
 })();

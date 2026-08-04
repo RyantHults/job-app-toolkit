@@ -169,13 +169,13 @@
     return anyResponded ? merged : null;
   }
 
-  // Fill every frame of the tab from the profile and sum the results. When
-  // nothing matched anywhere, a "force" pass asks the main frame to walk even
-  // same-origin iframes that carry their own content script (per-frame
-  // messaging may not have reached them).
-  async function fillPageAcrossFrames(tab, fields) {
+// Fill every frame of the tab from the profile and sum the results. When
+// nothing matched anywhere, a "force" pass asks the main frame to walk even
+// same-origin iframes that carry their own content script (per-frame
+// messaging may not have reached them).
+async function fillPageAcrossFrames(tab, fields) {
     const frameIds = await frameIdsOf(tab);
-    const totals = { filled: 0, skipped: 0, unmatched: 0 };
+    const totals = { filled: 0, skipped: 0, unmatched: 0, skippedNames: [] };
     let anyResponded = false;
     let responded = 0;
 
@@ -198,6 +198,7 @@
       totals.filled += res.filled || 0;
       totals.skipped += res.skipped || 0;
       totals.unmatched += res.unmatched || 0;
+      if (Array.isArray(res.skippedNames)) totals.skippedNames.push(...res.skippedNames);
     }
 
     if (
@@ -215,6 +216,7 @@
         totals.filled += forced.filled || 0;
         totals.skipped += forced.skipped || 0;
         totals.unmatched = forced.unmatched || 0;
+        if (Array.isArray(forced.skippedNames)) totals.skippedNames.push(...forced.skippedNames);
       }
     }
 
@@ -246,13 +248,27 @@
     return null;
   }
 
-  // Human-readable summary of the skipped buckets from collectFields.
-  function skippedText(res) {
-    const parts = [];
-    if (res.skippedExisting) parts.push(res.skippedExisting + " already in profile");
-    if (res.skippedEmpty) parts.push(res.skippedEmpty + " empty");
-    return parts.length ? " Skipped: " + parts.join(", ") + "." : "";
+// Human-readable summary of the skipped buckets from collectFields.
+function skippedText(res) {
+  const parts = [];
+  if (res.skippedExisting) parts.push(res.skippedExisting + " already in profile");
+  if (res.skippedEmpty) parts.push(res.skippedEmpty + " empty");
+  return parts.length ? " Skipped: " + parts.join(", ") + "." : "";
+}
+
+// Build a fill toast message; when nothing was filled, include the skipped
+// field names so the user can see exactly what the code considers "already filled".
+function fillSummary(res) {
+  let msg = "Filled " + res.filled + ", skipped " + res.skipped;
+  if (res.unmatched) msg += ", unmatched " + res.unmatched;
+  if (res.filled === 0 && Array.isArray(res.skippedNames) && res.skippedNames.length) {
+    const names = res.skippedNames.slice(0, 5).join(", ");
+    const more = res.skippedNames.length > 5 ? ", \u2026" : "";
+    msg += " (already has data: " + names + more + ")";
   }
+  msg += ".";
+  return msg;
+}
 
   // Merge collected fields into the profile, persist once, and describe the
   // outcome. Mutates data.profiles[profileName].
@@ -308,9 +324,7 @@
         api.notify(tab.id, "Job App Toolkit", "Cannot fill on this page.");
         return;
       }
-      let msg = "Filled " + res.filled + ", skipped " + res.skipped;
-      if (res.unmatched) msg += ", unmatched " + res.unmatched;
-      api.notify(tab.id, "Job App Toolkit", msg + ".");
+      api.notify(tab.id, "Job App Toolkit", fillSummary(res));
       return;
     }
 
@@ -393,8 +407,8 @@
   // Quick actions (popup) + request handlers (options page)
   // ------------------------------------------------------------------
 
-  // Fill the page the user is working on from the active profile.
-  async function fillPageAction(api) {
+// Fill the page the user is working on from the active profile.
+async function fillPageAction(api) {
     const tab = await getWebTab(api);
     if (!tab) return { ok: false, error: "No web page to fill." };
     const data = await api.getModuleData(MODULE_ID);
@@ -406,9 +420,7 @@
     if (!res) {
       return { ok: false, error: "Form Filler is inactive on this page." };
     }
-    let msg = "Filled " + res.filled + ", skipped " + res.skipped;
-    if (res.unmatched) msg += ", unmatched " + res.unmatched;
-    msg += ".";
+    const msg = fillSummary(res);
     api.notify(tab.id, "Job App Toolkit", msg);
     return { ok: true, message: msg };
   }

@@ -114,6 +114,22 @@ h2 {
   overflow-y: auto;
 }
 
+.search-row { margin-bottom: 8px; }
+#field-search { 
+  width: 100%; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 4px; 
+  font: inherit; box-sizing: border-box; 
+}
+#field-search:focus { 
+  border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); outline: none; 
+}
+
+/* Match opacity highlighting */
+.field-row { 
+  background: rgba(34, 197, 94, var(--match-opacity, 0)); 
+  transition: background 120ms; 
+}
+.field-row.hidden { display: none !important; }
+
 .field-row {
   display: flex;
   align-items: center;

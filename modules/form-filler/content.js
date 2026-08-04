@@ -47,19 +47,21 @@
 
   // Fallback hint elements when a field has no label/name/id.
   const HEADER_SELECTOR =
-    'h1, h2, h3, h4, h5, h6, [class*="label" i], [class*="title" i], b, strong';
+    'h1, h2, h3, h4, h5, h6, label, [class*="label" i], [class*="title" i], b, strong';
 
   // ------------------------------------------------------------------
   // Normalisation
   // ------------------------------------------------------------------
 
-  // Lowercase and collapse runs of underscores / hyphens / whitespace to a
-  // single space, then trim, so "first_name", "firstName" and "First Name"
-  // all compare equal.
+  // Lowercase, strip anything that isn't a letter or digit (so required-field
+  // asterisks, dots, commas, underscores, hyphens, etc. never interfere with
+  // matching), collapse whitespace runs to a single space, then trim. So
+  // "First Name*", "first_name", "firstName" and "First Name" all compare
+  // equal.
   function normalize(str) {
     return String(str == null ? "" : str)
       .toLowerCase()
-      .replace(/[_\-\s]+/g, " ")
+      .replace(/[^a-z0-9]+/g, " ")
       .trim();
   }
 
@@ -103,17 +105,14 @@
     return parts.join(" ");
   }
 
-  // Walk up to the enclosing <fieldset> and use its <legend>; otherwise scan
-  // backwards in document order for the closest preceding heading / label-ish
-  // element. The walker approach naturally covers preceding siblings, ancestors
-  // and the preceding siblings of ancestors.
+  // Walk backwards in document order for the closest preceding heading /
+  // label-ish element (covering preceding siblings, ancestors and the
+  // preceding siblings of ancestors). Prefer that specific label over an
+  // enclosing <fieldset> <legend>, which describes the group rather than the
+  // field; only fall back to the legend when the walk finds nothing nearby
+  // (nothing at all, or only elements outside the fieldset).
   function getHeaderLikeText(el, doc) {
     const root = doc || document;
-    const fieldset = el.closest("fieldset");
-    if (fieldset) {
-      const legend = fieldset.querySelector(":scope > legend");
-      if (legend && legend.textContent.trim() !== "") return legend.textContent;
-    }
     if (!root.body || !root.body.contains(el)) return "";
     const walker = root.createTreeWalker(root.body, NodeFilter.SHOW_ELEMENT);
     walker.currentNode = el;
@@ -121,8 +120,20 @@
     while ((node = walker.previousNode())) {
       if (node.matches && node.matches(HEADER_SELECTOR)) {
         const text = node.textContent.trim();
-        if (text.length > 0 && text.length < 200) return text;
+        if (text.length > 0 && text.length < 200) {
+          const fieldset = el.closest("fieldset");
+          if (fieldset && !fieldset.contains(node)) {
+            const legend = fieldset.querySelector(":scope > legend");
+            if (legend && legend.textContent.trim() !== "") return legend.textContent;
+          }
+          return text;
+        }
       }
+    }
+    const fieldset = el.closest("fieldset");
+    if (fieldset) {
+      const legend = fieldset.querySelector(":scope > legend");
+      if (legend && legend.textContent.trim() !== "") return legend.textContent;
     }
     return "";
   }
@@ -184,7 +195,8 @@
   }
 
   // Match each profile entry to at most one field, and each field to at most
-  // one entry. Exact candidate matches win over "contains" matches.
+  // one entry. Exact candidate matches win over "contains" matches, which win
+  // over word-overlap matches.
   function matchFields(entries, fieldList) {
     const matches = [];
     const usedFields = new Set();
@@ -236,7 +248,70 @@
       }
     }
 
+    // Pass 3 — word-overlap matches. Handles phrasing that shares the same
+    // significant words but in different order or with extra words, e.g.
+    // "personal website portfolio" vs "website or portfolio". Requires enough
+    // common words that the two are clearly the same field. Prefer the highest
+    // overlap, then the highest-priority candidate.
+    for (const entry of entries) {
+      if (usedEntries.has(entry)) continue;
+      let best = null;
+      for (const field of fieldList) {
+        if (usedFields.has(field.el)) continue;
+        for (let i = 0; i < field.candidates.length; i++) {
+          const cand = field.candidates[i];
+          for (const norm of entry.norms) {
+            const overlap = tokenOverlap(norm, cand);
+            if (overlap > 0) {
+              if (
+                !best ||
+                overlap > best.overlap ||
+                (overlap === best.overlap && i < best.candIdx)
+              ) {
+                best = { key: entry.key, entry, field, candIdx: i, overlap };
+              }
+            }
+          }
+        }
+      }
+      if (best) {
+        matches.push({ key: best.key, entry: best.entry, field: best.field });
+        usedFields.add(best.field.el);
+        usedEntries.add(best.entry);
+      }
+    }
+
     return matches;
+  }
+
+  // Fraction of the significant words of the shorter string that also appear
+  // in the longer one, after dropping tiny/stop-like words ("a", "or", "the").
+  // Returns 0 unless the two share at least two significant words AND every
+  // significant word of the shorter string appears in the longer one. This
+  // lets "personal website portfolio" match "website or portfolio" but stops
+  // "legal first name" from matching "legal last name" (each has a
+  // distinguishing word the other lacks).
+  function tokenOverlap(a, b) {
+    const wordsA = a.split(" ").filter(isSignificantWord);
+    const wordsB = b.split(" ").filter(isSignificantWord);
+    if (wordsA.length === 0 || wordsB.length === 0) return 0;
+    const [small, large] = wordsA.length <= wordsB.length ? [wordsA, wordsB] : [wordsB, wordsA];
+    let common = 0;
+    const used = new Set();
+    for (const w of small) {
+      if (used.has(w)) continue;
+      if (large.indexOf(w) !== -1) {
+        common++;
+        used.add(w);
+      }
+    }
+    if (common < 2 || common !== small.length) return 0;
+    return (common / small.length + common / large.length) / 2;
+  }
+
+  // Words under three letters are too generic to carry identity ("or", "of").
+  function isSignificantWord(word) {
+    return word.length >= 3;
   }
 
   // ------------------------------------------------------------------
@@ -261,6 +336,39 @@
     if (typeof value === "boolean") return value;
     const s = String(value).trim().toLowerCase();
     return s === "true" || s === "yes" || s === "1" || s === "checked" || s === "on" || s === "y";
+  }
+
+  // Conservative test for "this select option is a placeholder prompt rather
+  // than a real choice". Only obvious prompts count: empty/disabled options,
+  // sentinel ids, iCIMS-style "legacy" markers, all-punctuation text, and
+  // explicit select/choose/pick wording. Real labels like "Selective Service"
+  // must not match.
+  function isPlaceholderOption(opt) {
+    if (!opt) return false;
+    if (opt.disabled) return true;
+    const text = String(opt.textContent || "").trim();
+    if (text === "") return true;
+    if (opt.hasAttribute && opt.hasAttribute("legacy")) return true;
+    if (String(opt.value).trim() === "-1") return true;
+    if (/^[-–—_*•.\s]+$/.test(text)) return true;
+    if (/^(select|choose|pick)([….\s:?]|$)/i.test(text)) return true;
+    if (/^(please\s+(select|choose|pick)|make\s+a\s+selection)/i.test(text)) return true;
+    return false;
+  }
+
+  // Does this field hold real data? Placeholder prompts do not count, so
+  // fields still sitting at their default state are treated as empty. A
+  // checkbox is never "empty" in this sense (both checked states are
+  // meaningful); callers handle checkboxes separately.
+  function fieldHasData(el) {
+    if (el && el.tagName === "SELECT") {
+      const opt = el.selectedOptions ? el.selectedOptions[0] : null;
+      if (!opt) return false;
+      return !isPlaceholderOption(opt);
+    }
+    if (!el) return false;
+    const value = el.value;
+    return value !== null && value !== undefined && String(value).trim() !== "";
   }
 
   // Returns true if the field was filled, false if it was skipped (e.g. a
@@ -313,20 +421,24 @@
     let filled = 0;
     let skipped = 0;
     const matchedKeys = new Set();
+    const skippedNames = [];
 
     for (const m of matches) {
       const el = m.field.el;
-      // Hard rule: never overwrite. For text-like fields a non-empty value
-      // counts as filled; for checkboxes the current checked state is the
-      // "value", so a box that already matches its target state is skipped.
+      // Never overwrite data. A field "has data" when it holds a real value;
+      // placeholder prompts (e.g. a dropdown showing "— Make a Selection —"
+      // with an internal sentinel value) do not count. For checkboxes the
+      // current checked state is the "value", so a box that already matches
+      // its target state is skipped.
       const isCheckbox = el.type === "checkbox";
       const target = m.entry.value;
       const isFilled = isCheckbox
         ? el.checked === isTruthyBoolean(target)
-        : el.value !== "";
+        : fieldHasData(el);
       if (isFilled) {
         skipped++;
         matchedKeys.add(m.key);
+        skippedNames.push(getFieldTitle(el, root) || el.name || el.id);
         continue;
       }
       if (fillField(el, target)) {
@@ -336,7 +448,7 @@
     }
 
     const unmatched = entries.filter((e) => !matchedKeys.has(e.key)).length;
-    return { filled, skipped, unmatched, matched: matchedKeys.size };
+    return { filled, skipped, skippedNames, unmatched, matched: matchedKeys.size };
   }
 
   // Human-readable title for a field: explicit label text and any title/heading
@@ -351,6 +463,18 @@
       el.getAttribute("placeholder") ||
       "";
     return String(title).trim().replace(/\s+/g, " ");
+  }
+
+  // Clean human-readable field text for storage: strip anything that isn't a
+  // letter or digit so decorative punctuation (e.g. the required-field
+  // asterisk in "Legal First Name*") never ends up saved in a profile key or
+  // label. Real element name/id attributes are kept verbatim via `cleanFieldName`'s
+  // callers, since those are stable identifiers that matching re-normalizes anyway.
+  function cleanFieldName(str) {
+    return String(str == null ? "" : str)
+      .replace(/[^a-z0-9]+/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   // Custom drop-down pickers render a visible widget (a button / combobox) while
@@ -413,11 +537,12 @@
     const candidates = getCandidates(el);
 
     // Matching key: the element's actual name/id first (never placeholder
-    // text), then the title above, then any remaining candidate.
+    // text), then the title above, then any remaining candidate. Real name/id
+    // attributes are kept verbatim; title text is cleaned of punctuation.
     const rawName = String(el.name || el.id || "").trim();
-    const name = rawName || getFieldTitle(el) || candidates[0] || "";
+    const name = rawName || cleanFieldName(getFieldTitle(el)) || candidates[0] || "";
 
-    let fieldLabel = getFieldTitle(el) || rawName || candidates[0] || "";
+    let fieldLabel = cleanFieldName(getFieldTitle(el)) || rawName || candidates[0] || "";
     if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
 
     const value = el.type === "checkbox" ? String(el.checked) : el.value;
@@ -440,13 +565,14 @@
     for (const field of fieldList) {
       const el = field.el;
       const rawName = String(el.name || el.id || "").trim();
-      const name = rawName || getFieldTitle(el, root) || field.candidates[0] || "";
+      const name = rawName || cleanFieldName(getFieldTitle(el, root)) || field.candidates[0] || "";
       if (!name) {
         skippedEmpty++;
         continue;
       }
-      const value = el.type === "checkbox" ? String(el.checked) : el.value;
-      if (value === undefined || value === null || String(value) === "") {
+      const isCheckbox = el.type === "checkbox";
+      const value = isCheckbox ? String(el.checked) : el.value;
+      if (!isCheckbox && !fieldHasData(el)) {
         skippedEmpty++;
         continue;
       }
@@ -454,7 +580,8 @@
         skippedExisting++;
         continue;
       }
-      let fieldLabel = getFieldTitle(el, root) || rawName || field.candidates[0] || "";
+      let fieldLabel =
+        cleanFieldName(getFieldTitle(el, root)) || rawName || field.candidates[0] || "";
       if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
       results.push({ name, value, fieldLabel });
     }
@@ -538,12 +665,12 @@
     return all;
   }
 
-  // Fill this document and all reachable same-origin iframes, summing results.
-  // "Unmatched" counts profile entries that matched no field anywhere, so the
-  // per-document tallies are merged (a wrapper page with no fields must not
-  // report every profile entry as unmatched).
-  function fillPageAll(activeProfile, force) {
-    const totals = { filled: 0, skipped: 0, unmatched: 0, docs: 0 };
+// Fill this document and all reachable same-origin iframes, summing results.
+// "Unmatched" counts profile entries that matched no field anywhere, so the
+// per-document tallies are merged (a wrapper page with no fields must not
+// report every profile entry as unmatched).
+function fillPageAll(activeProfile, force) {
+    const totals = { filled: 0, skipped: 0, unmatched: 0, docs: 0, skippedNames: [] };
     let matched = 0;
     forEachSameOriginDoc(
       (doc) => {
@@ -551,6 +678,7 @@
         const r = fillPage(activeProfile, doc);
         totals.filled += r.filled;
         totals.skipped += r.skipped;
+        if (Array.isArray(r.skippedNames)) totals.skippedNames.push(...r.skippedNames);
         matched += r.matched;
       },
       undefined,
