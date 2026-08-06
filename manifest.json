@@ -6,17 +6,27 @@
   "browser_action": {
     "default_popup": "core/popup.html"
   },
-  "permissions": ["storage", "contextMenus", "tabs", "<all_urls>"],
+  "permissions": ["storage", "contextMenus", "tabs", "<all_urls>", "unlimitedStorage"],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["modules/form-filler/content.js"],
+      "js": ["core/content.js", "modules/form-filler/content.js"],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": ["*://www.linkedin.com/*"],
+      "js": ["core/content.js", "modules/site-settings/content.js"],
+      "run_at": "document_idle"
     }
   ],
   "background": {
-    "scripts": ["core/storage.js", "core/background.js", "modules/form-filler/background.js"],
+    "scripts": [
+      "core/storage.js",
+      "core/background.js",
+      "modules/form-filler/background.js",
+      "modules/site-settings/background.js"
+    ],
     "persistent": false
   },
   "icons": {

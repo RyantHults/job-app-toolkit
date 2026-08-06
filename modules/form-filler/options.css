@@ -123,6 +123,40 @@ h2 {
   border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); outline: none; 
 }
 
+#ai-context-body {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font: inherit;
+  resize: vertical;
+}
+
+#ai-context-body:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+  outline: none;
+}
+
+#ai-instructions {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font: inherit;
+  resize: vertical;
+}
+
+#ai-instructions:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+  outline: none;
+}
+
 /* Match opacity highlighting */
 .field-row { 
   background: rgba(34, 197, 94, var(--match-opacity, 0)); 

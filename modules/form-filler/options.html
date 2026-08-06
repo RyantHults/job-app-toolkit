@@ -50,6 +50,69 @@
     </div>
   </section>
 
+  <!-- Button sites whitelist -->
+  <section class="section" aria-label="Button sites">
+    <h2>Button sites</h2>
+    <p class="subtitle">Show per-field Add/Fill buttons on forms on these sites.</p>
+    <div class="row">
+      <input type="text" id="whitelist-input" placeholder="example.com" aria-label="Site domain to whitelist">
+      <button type="button" id="whitelist-add" class="btn btn-sm">Add</button>
+    </div>
+    <ul id="whitelist-list"></ul>
+  </section>
+
+  <!-- AI answers -->
+  <section class="section" aria-label="AI answers">
+    <h2>AI answers</h2>
+    <p class="subtitle">Answer text fields with AI. Right-click a field and choose "Answer with AI".</p>
+    <div class="row">
+      <label for="ai-endpoint" class="label">Endpoint</label>
+      <input type="url" id="ai-endpoint" placeholder="https://api.openai.com/v1/chat/completions" aria-label="API endpoint">
+    </div>
+    <div class="row">
+      <label for="ai-model" class="label">Model</label>
+      <input type="text" id="ai-model" placeholder="gpt-4o-mini" aria-label="Model name">
+    </div>
+    <div class="row">
+      <label for="ai-instructions" class="label">Instructions for the AI agent</label>
+    </div>
+    <textarea id="ai-instructions" rows="6" aria-label="AI agent instructions"></textarea>
+    <div class="row">
+      <button type="button" id="ai-instructions-reset" class="btn">Reset to default</button>
+    </div>
+    <p class="subtitle">Static instructions only — the question, your background, and the field's length limit are added automatically. Blank uses the built-in default.</p>
+    <div class="row">
+      <label for="ai-key" class="label">API key</label>
+      <input type="password" id="ai-key" placeholder="sk-…" aria-label="API key">
+      <button type="button" id="ai-key-clear" class="btn" hidden>Remove key</button>
+    </div>
+    <p class="subtitle" id="ai-key-status"></p>
+    <div class="row">
+      <button type="button" id="ai-save" class="btn btn-primary">Save AI settings</button>
+    </div>
+  </section>
+
+  <!-- AI background -->
+  <section class="section" aria-label="AI background">
+    <h2>AI background</h2>
+    <p class="subtitle">Experiences and projects the AI draws on when answering. The more specific you are, the better the answers.</p>
+    <div class="row">
+      <button type="button" id="ai-context-add" class="btn">+ New entry</button>
+    </div>
+    <ul id="ai-context-list"></ul>
+    <div id="ai-context-editor" hidden>
+      <div class="row">
+        <input type="text" id="ai-context-title" placeholder="e.g. Staff Software Engineer — Acme (2021–2024)" aria-label="Entry title">
+      </div>
+      <textarea id="ai-context-body" rows="6" placeholder="What you did, what you built, outcomes…" aria-label="Entry details"></textarea>
+      <div class="row">
+        <button type="button" id="ai-context-save" class="btn btn-primary">Save</button>
+        <button type="button" id="ai-context-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="ai-context-delete" class="btn">Delete</button>
+      </div>
+    </div>
+  </section>
+
   <!-- Status / result line -->
   <p id="status" class="status" aria-live="polite"></p>
 

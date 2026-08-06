@@ -7,7 +7,8 @@
  *  - the shared "Job App Toolkit" context-menu root;
  *  - a message router: "jtk:*" is core-reserved, "<moduleId>:*" is dispatched
  *    to the owning module;
- *  - in-page toasts (routed to the content script of a tab), module activity
+ *  - in-page toasts (routed to the content script of a tab, with optional
+ *    action button — e.g. "Undo" — for immediate recovery), module activity
  *    toggling and the last-focused web-tab tracker (used so module options
  *    pages can fill the page the user is working on).
  */
@@ -28,14 +29,17 @@
   // Ask the content script of a tab to show an in-page toast. Feedback is
   // rendered on the page itself, so it never depends on OS desktop
   // notifications. Errors are ignored: the page may have no content script
-  // (e.g. a browser-internal page).
-  function notify(tabId, title, message) {
+  // (e.g. a browser-internal page). An optional `action` ({ type, label,
+  // payload }) renders an action button on the toast; clicking it sends
+  // `{ type, ...payload }` back to the background.
+  function notify(tabId, title, message, action) {
     if (typeof tabId !== "number") return Promise.resolve(false);
     return browser.tabs
       .sendMessage(tabId, {
         type: "jtk:showToast",
         title: title || "",
-        message: message || ""
+        message: message || "",
+        action: action || null
       })
       .then(
         () => true,
@@ -144,7 +148,7 @@
   // Message router
   // ------------------------------------------------------------------
 
-  browser.runtime.onMessage.addListener(function onMessage(message) {
+  browser.runtime.onMessage.addListener(function onMessage(message, sender) {
     if (!message || typeof message.type !== "string") return undefined;
 
     switch (message.type) {
@@ -203,8 +207,8 @@
       default: {
         for (const mod of Object.values(modules)) {
           if (message.type.indexOf(mod.id + ":") === 0) {
-            if (typeof mod.handleMessage !== "function") return undefined;
-            return Promise.resolve(mod.handleMessage(message, null, moduleApi()));
+          if (typeof mod.handleMessage !== "function") return undefined;
+          return Promise.resolve(mod.handleMessage(message, sender, moduleApi()));
           }
         }
         return undefined;

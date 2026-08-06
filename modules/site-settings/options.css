@@ -1,0 +1,250 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 640px;
+  margin: 0 auto;
+  padding: 16px;
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #111827;
+  background: #ffffff;
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0 0 2px 0;
+}
+
+.subtitle {
+  margin: 0 0 12px 0;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+h2 {
+  font-size: 13px;
+  margin: 0 0 4px 0;
+  color: #374151;
+}
+
+h3 {
+  font-size: 12px;
+  margin: 0;
+  color: #374151;
+}
+
+.hint {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.section {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #374151;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toggle input {
+  margin: 0;
+}
+
+.toggle-row {
+  margin: 0 0 8px 0;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.keyword-panel {
+  margin-top: 12px;
+  padding: 8px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 4px;
+  background: #f8fafc;
+}
+
+.list-head {
+  margin-bottom: 4px;
+}
+
+.list-head .btn {
+  margin-left: auto;
+}
+
+ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.company-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.company-row:last-child {
+  border-bottom: none;
+}
+
+/* Name sits in its own scrollable box so a very long name never expands the
+   row. min-width: 0 lets it shrink below its content; overflow-x handles the
+   horizontal scroll; max-height + overflow-y is defensive against newlines. */
+.list-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-height: 2.4em;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  color: #111827;
+  scrollbar-width: thin;
+  scrollbar-color: #d1d5db transparent;
+}
+
+.list-name::-webkit-scrollbar {
+  height: 4px;
+}
+
+.list-name::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 2px;
+}
+
+/* Keep the Remove button pinned at the row's end. */
+.company-row .btn {
+  flex: 0 0 auto;
+}
+
+.empty {
+  font-style: italic;
+  color: #9ca3af;
+  padding: 4px 0;
+}
+
+.btn {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #f9fafb;
+  color: #111827;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: #f3f4f6;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.btn-primary {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+
+.btn-primary:hover {
+  background: #1d4ed8;
+}
+
+.btn-secondary {
+  background: #f9fafb;
+  border-color: #d1d5db;
+  color: #111827;
+}
+
+.btn-secondary:hover {
+  background: #f3f4f6;
+}
+
+.btn-sm {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.status {
+  margin: 0;
+  font-style: italic;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.modal-overlay[hidden] {
+  display: none !important;
+}
+
+.modal-card {
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 16px;
+  width: 280px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.modal-message {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  color: #111827;
+  line-height: 1.4;
+}
+
+.modal-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: inherit;
+  margin-bottom: 12px;
+  outline: none;
+}
+
+.modal-input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

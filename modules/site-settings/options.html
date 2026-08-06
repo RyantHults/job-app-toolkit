@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="options.css">
+  <title>Site Settings — Job App Toolkit</title>
+</head>
+<body>
+  <h1>Site Settings</h1>
+  <p class="subtitle">Job App Toolkit module — per-site settings for job boards</p>
+
+  <!-- Module activity -->
+  <section class="section" aria-label="Module activity">
+    <div class="row">
+      <label class="toggle">
+        <input type="checkbox" id="active-toggle">
+        <span>Module active</span>
+      </label>
+    </div>
+  </section>
+
+  <!-- LinkedIn company lists and title keywords -->
+  <section class="section" aria-label="LinkedIn job search settings">
+    <h2>LinkedIn Job Search</h2>
+    <p class="hint">Blocked postings are hidden from search results; highlighted postings are tinted. A company can only be blocked or highlighted, not both. Postings whose titles contain a listed keyword are also hidden; matching is case-insensitive.</p>
+    <div class="row toggle-row">
+      <label class="toggle">
+        <input type="checkbox" id="hide-applied-toggle">
+        <span>Hide postings I've applied to</span>
+      </label>
+    </div>
+    <div class="columns">
+      <div class="column">
+        <div class="row list-head">
+          <h3>Blocked</h3>
+          <button type="button" id="add-blocked-btn" class="btn btn-sm">+ Add</button>
+        </div>
+        <ul id="blocked-list"></ul>
+      </div>
+      <div class="column">
+        <div class="row list-head">
+          <h3>Highlighted</h3>
+          <button type="button" id="add-highlighted-btn" class="btn btn-sm">+ Add</button>
+        </div>
+        <ul id="highlighted-list"></ul>
+      </div>
+    </div>
+
+    <div class="keyword-panel">
+      <div class="row list-head">
+        <h3>Title keywords to hide</h3>
+        <button type="button" id="add-keyword-btn" class="btn btn-sm">+ Add</button>
+      </div>
+      <ul id="keyword-list"></ul>
+    </div>
+  </section>
+
+  <!-- Status / result line -->
+  <p id="status" class="status" aria-live="polite"></p>
+
+  <!-- Inline modal overlay -->
+  <div id="modal-overlay" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="modal-input" type="text" hidden />
+      <div class="modal-actions">
+        <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="modal-confirm" class="btn btn-primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../../core/storage.js"></script>
+  <script src="../../core/ui.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

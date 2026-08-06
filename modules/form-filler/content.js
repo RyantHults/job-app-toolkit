@@ -8,27 +8,11 @@
   "use strict";
 
   const MODULE_ID = "form-filler";
-  const STORAGE_KEY = "jobAppToolkit";
 
-  // Modules can be toggled off from the popup. Keep a cached flag (refreshed on
-  // load and via a broadcast from the background) so handlers no-op cheaply
-  // when inactive. Absent data means the module is active by default.
-  let moduleActive = true;
-
-  function isActiveInStore(data) {
-    const mod = data && data.modules && data.modules[MODULE_ID];
-    return mod ? mod.active === true : true;
-  }
-
-  async function refreshActive() {
-    try {
-      const res = await browser.storage.sync.get(STORAGE_KEY);
-      moduleActive = isActiveInStore(res[STORAGE_KEY]);
-    } catch (err) {
-      moduleActive = true;
-    }
-  }
-  refreshActive();
+  // Module activity and in-page toasts are provided by core/content.js (loaded
+  // before this script). Refresh the cached active flag on load so handlers
+  // no-op cheaply while the module is toggled off.
+  window.jobAppToolkit.content.refreshActive(MODULE_ID);
 
   // Mark this document as carrying the content script so a parent frame's
   // same-origin iframe walk knows not to process it twice: frames with their
@@ -530,23 +514,49 @@
     return findFieldNear(document.activeElement);
   }
 
-  function getFocusedField(targetElementId) {
-    const el = resolveFieldElement(targetElementId);
-    if (!el) return null;
-
-    const candidates = getCandidates(el);
+  // Shared extraction of the { name, value, fieldLabel } triple for a field.
+  // Used by the focused-field capture, the page-wide collect, and the in-page
+  // save/up-arrow buttons so all three describe a field identically. A
+  // checkbox's value is its checked state as a string.
+  function describeField(el, doc) {
+    const root = doc || document;
+    const candidates = getCandidates(el, root);
 
     // Matching key: the element's actual name/id first (never placeholder
     // text), then the title above, then any remaining candidate. Real name/id
     // attributes are kept verbatim; title text is cleaned of punctuation.
     const rawName = String(el.name || el.id || "").trim();
-    const name = rawName || cleanFieldName(getFieldTitle(el)) || candidates[0] || "";
+    const name = rawName || cleanFieldName(getFieldTitle(el, root)) || candidates[0] || "";
 
-    let fieldLabel = cleanFieldName(getFieldTitle(el)) || rawName || candidates[0] || "";
+    let fieldLabel = cleanFieldName(getFieldTitle(el, root)) || rawName || candidates[0] || "";
     if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
 
     const value = el.type === "checkbox" ? String(el.checked) : el.value;
     return { name, value, fieldLabel };
+  }
+
+  function getFocusedField(targetElementId) {
+    const el = resolveFieldElement(targetElementId);
+    if (!el) return null;
+    return describeField(el);
+  }
+
+  // Describe a field for the "Answer with AI" flow: everything describeField
+  // captures (name, label, value) plus the constraints the prompt needs —
+  // maxlength, single-line vs multiline, the element type/tag, and the page
+  // title as extra context.
+  function describeAIField(el) {
+    return {
+      ok: true,
+      maxLength:
+        typeof el.maxLength === "number" && el.maxLength > 0 ? el.maxLength : null,
+      singleLine: el.tagName === "INPUT",
+      type:
+        el.tagName === "INPUT" ? el.getAttribute("type") || "text" : el.tagName.toLowerCase(),
+      tagName: el.tagName,
+      pageTitle: (el.ownerDocument || document).title || "",
+      ...describeField(el, el.ownerDocument)
+    };
   }
 
   // Collect every field on the page that has been filled out and is not yet
@@ -564,15 +574,12 @@
 
     for (const field of fieldList) {
       const el = field.el;
-      const rawName = String(el.name || el.id || "").trim();
-      const name = rawName || cleanFieldName(getFieldTitle(el, root)) || field.candidates[0] || "";
-      if (!name) {
+      const desc = describeField(el, root);
+      if (!desc.name) {
         skippedEmpty++;
         continue;
       }
-      const isCheckbox = el.type === "checkbox";
-      const value = isCheckbox ? String(el.checked) : el.value;
-      if (!isCheckbox && !fieldHasData(el)) {
+      if (!(el.type === "checkbox") && !fieldHasData(el)) {
         skippedEmpty++;
         continue;
       }
@@ -580,10 +587,7 @@
         skippedExisting++;
         continue;
       }
-      let fieldLabel =
-        cleanFieldName(getFieldTitle(el, root)) || rawName || field.candidates[0] || "";
-      if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
-      results.push({ name, value, fieldLabel });
+      results.push(desc);
     }
 
     return {
@@ -692,92 +696,594 @@ function fillPageAll(activeProfile, force) {
     return totals;
   }
 
-  // Fill only the right-clicked/focused field, if it matches a profile entry.
-  // Skips non-empty fields unless overwrite is requested.
-  function fillFocusedField(fields, overwrite, targetElementId) {
+  // ------------------------------------------------------------------
+  // In-page per-field buttons (save add / up-arrow fill)
+  // ------------------------------------------------------------------
+  //
+  // On whitelisted sites every fillable field gets a small button pair beside
+  // it: the save (floppy) icon captures the field's current value into the
+  // active profile, the up arrow fills the field from the active profile
+  // (unconditionally — this is a deliberate per-field override, unlike
+  // fill-page which never overwrites existing data). The buttons replace the
+  // old context-menu actions. They render only when the module is active AND
+  // the current hostname is whitelisted.
+
+  const STORAGE_KEY = "jobAppToolkit";
+  const STYLE_ID = "jtk-form-filler-styles";
+  const BTN_WRAPPER_CLASS = "jtk-ff-btns";
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const SPINNER_STYLE_ID = "jtk-form-filler-spinner-styles";
+  const SPINNER_CLASS = "jtk-ff-spinner";
+  // Spinner diameter in px. Keep in sync with the .jtk-ff-spinner CSS rule
+  // (width/height) — positionSpinner centers the ring on the field using this.
+  const SPINNER_SIZE = 14;
+  // Safety net only — the background hides the spinner first on its normal
+  // paths (it aborts the whole AI flow at 90s and toasts "timed out"). This
+  // catches a background that died before it could send the hide message.
+  // Set slightly longer than the background's 90s deadline so the background
+  // normally wins.
+  const SPINNER_MAX_AGE_MS = 100000;
+
+  let config = { whitelist: [], profileFields: {} };
+
+  async function loadConfig() {
+    try {
+      const res = await browser.storage.sync.get(STORAGE_KEY);
+      const store = res && res[STORAGE_KEY];
+      const mod = store && store.modules && store.modules[MODULE_ID];
+      let whitelist = [];
+      if (mod && Array.isArray(mod.whitelist)) whitelist = mod.whitelist;
+      let profileFields = {};
+      const active = mod && mod.profiles && mod.profiles[mod.activeProfile];
+      if (active && active.fields && typeof active.fields === "object") {
+        profileFields = active.fields;
+      }
+      config = { whitelist: whitelist, profileFields: profileFields };
+    } catch (err) {
+      config = { whitelist: [], profileFields: {} };
+    }
+  }
+
+  // Hostname normalisation for the whitelist. Entries are stored as bare
+  // hostnames, but users may paste full URLs or append paths/ports, so run
+  // anything URL-ish through the URL parser and keep the hostname. Both sides
+  // are lowercased and stripped of a leading "www." and a trailing dot.
+  function normalizeHost(host) {
+    let value = String(host == null ? "" : host).trim().toLowerCase();
+    if (!value) return "";
+    if (value.includes("://") || /[/:?#]/.test(value)) {
+      try {
+        value = new URL(value.includes("://") ? value : "https://" + value).hostname;
+      } catch (err) {
+        // Not a URL — fall back to the raw (already lowercased) value.
+      }
+    }
+    return value.replace(/^www\./, "").replace(/\.$/, "");
+  }
+
+  function isWhitelisted() {
+    const host = normalizeHost(location.hostname);
+    if (!host) return false;
+    return config.whitelist.some((entry) => {
+      const norm = normalizeHost(entry);
+      if (!norm) return false;
+      if (norm === host) return true;
+      // An entry also whitelists its subdomains, but never a bare TLD: a
+      // dotted entry like "example.com" matches "jobs.example.com", while a
+      // dot-less entry ("com") can never match anything but itself.
+      return norm.indexOf(".") !== -1 && host.endsWith("." + norm);
+    });
+  }
+
+  function injectStyles(doc) {
+    const root = doc || document;
+    if (root.getElementById(STYLE_ID)) return;
+    const style = root.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent =
+      // The wrapper is a zero-height block so its in-flow footprint is nothing:
+      // the next sibling starts at the same line the field ended on. Only the
+      // painted buttons overflow (overflow:visible), and position:relative +
+      // the inline top set per-scan in ensureButtons lifts them so the pair is
+      // centered on the field's row, overlapping its right edge (a password-
+      // toggle style placement, since a full-width block field can never share
+      // its line with a sibling). z-index keeps the buttons above the input.
+      // Flex container: a height:0 flex box has no line box for its items, so
+      // align-items:center centers the 18px pair EXACTLY on the wrapper's y=0
+      // line (no baseline/line-height ambiguity) and justify-content:flex-end
+      // right-aligns it.
+      ".jtk-ff-btns{display:flex;justify-content:flex-end;align-items:center;height:0;overflow:visible;position:relative;z-index:1;}" +
+      ".jtk-ff-btn{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:none;border-radius:4px;background:transparent;font-size:12px;line-height:1;cursor:pointer;opacity:.45;transition:opacity .15s ease,background .15s ease;position:relative;z-index:1;}" +
+      ".jtk-ff-btns .jtk-ff-btn{color:inherit !important;}" +
+      ".jtk-ff-btn:hover{opacity:1;background:rgba(0,0,0,.06);}" +
+      ".jtk-ff-btn.jtk-ff-dim{opacity:.18;}" +
+      // The icons are inline SVGs: fixed 12px inside the 18px buttons (a 3px
+      // ring), display:block keeps flex centering exact, and
+      // pointer-events:none routes every click — and every synthetic event —
+      // to the button itself, never its icon.
+      ".jtk-ff-btn svg{width:12px;height:12px;display:block;pointer-events:none;flex-shrink:0;}";
+    (root.head || root.documentElement).appendChild(style);
+  }
+
+  // In-page toast via the core content runtime; falls back to the console
+  // when the core runtime is unavailable (harness/edge cases).
+  function toast(text) {
+    try {
+      if (typeof window.jobAppToolkit.content.showToast === "function") {
+        window.jobAppToolkit.content.showToast(text);
+        return;
+      }
+    } catch (err) {
+      // Fall through to the console.
+    }
+    console.log("[Form Filler] " + text);
+  }
+
+  // Does the active profile hold a value matching this field, under the same
+  // identity matching used by fill-page? Returns the match (with its profile
+  // key) or null.
+  function findProfileMatch(el) {
+    const entries = buildMatchEntries(config.profileFields);
+    const matches = matchFields(entries, [
+      { el: el, candidates: getCandidates(el, el.ownerDocument) }
+    ]);
+    return matches.length > 0 ? matches[0] : null;
+  }
+
+  // Build an inline SVG icon in the host document. Must use createElementNS —
+  // never innerHTML strings, which a page's CSP can block. fill="currentColor"
+  // inherits the button's pinned color (the stylesheet sets it to inherit, and
+  // the button's opacity dims the icon along with it). Sizing and
+  // pointer-events come from the injected .jtk-ff-btn svg rule. Shapes are
+  // [tag, attrs] pairs so both icons share the same construction path.
+  function createIcon(root, shapes) {
+    const svg = root.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 12 12");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (let i = 0; i < shapes.length; i++) {
+      const node = root.createElementNS(SVG_NS, shapes[i][0]);
+      const attrs = shapes[i][1];
+      for (const name in attrs) node.setAttribute(name, attrs[name]);
+      svg.appendChild(node);
+    }
+    return svg;
+  }
+
+  function createButtons(el, doc) {
+    // Buttons must be created in the field's own document — for fields inside
+    // a same-origin iframe that is NOT this frame's document.
+    const root = doc || el.ownerDocument || document;
+    const wrapper = root.createElement("span");
+    wrapper.className = BTN_WRAPPER_CLASS;
+
+    const addBtn = root.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "jtk-ff-btn jtk-ff-add";
+    // Save icon — a floppy disk: rounded shell, the shell's signature
+    // diagonally cut bottom-right corner, and the square metal shutter
+    // top-right cut out as a window (negative space, via fill-rule), so the
+    // silhouette reads even at 12px in a single fill color.
+    addBtn.appendChild(
+      createIcon(root, [
+        ["path", { "fill-rule": "evenodd", d: "M2 1h8a1 1 0 0 1 1 1v7.5L9.5 11H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1zM6.5 1.75h2.5v2.5H6.5z" }]
+      ])
+    );
+    addBtn.title = "Add this field to profile";
+    addBtn.setAttribute("aria-label", "Add this field to profile");
+    addBtn.addEventListener("click", (e) => onAddClick(e, el));
+
+    const fillBtn = root.createElement("button");
+    fillBtn.type = "button";
+    fillBtn.className = "jtk-ff-btn jtk-ff-fill";
+    // Up arrow — solid triangular head, notched neck, short shaft: reads as
+    // "pull the profile value up into this field".
+    fillBtn.appendChild(
+      createIcon(root, [
+        ["path", { d: "M6 1L10 5.5l-1 1.5L7 6v5H5V6L3 7l-1-1.5z" }]
+      ])
+    );
+    fillBtn.title = "Fill this field from profile";
+    fillBtn.setAttribute("aria-label", "Fill this field from profile");
+    fillBtn.addEventListener("click", (e) => onFillClick(e, el));
+
+    wrapper.appendChild(addBtn);
+    wrapper.appendChild(fillBtn);
+    return { wrapper: wrapper, addBtn: addBtn, fillBtn: fillBtn };
+  }
+
+  function onAddClick(e, el) {
+    e.preventDefault();
+    e.stopPropagation();
+    const desc = describeField(el, el.ownerDocument);
+    const display = desc.fieldLabel || desc.name;
+    if (desc.value === "" || desc.value === null || desc.value === undefined) {
+      toast('Field "' + display + '" is empty. Enter a value first.');
+      return;
+    }
+    browser.runtime
+      .sendMessage({
+        type: "form-filler:addField",
+        field: { name: desc.name, value: desc.value, fieldLabel: desc.fieldLabel }
+      })
+      .then((res) => {
+        if (res && res.message) toast(res.message);
+        else if (res && res.error) toast(res.error);
+      })
+      .catch((err) => {
+        console.error("[Form Filler] addField failed:", err);
+      });
+  }
+
+  function onFillClick(e, el) {
+    e.preventDefault();
+    e.stopPropagation();
+    const desc = describeField(el, el.ownerDocument);
+    const display = desc.fieldLabel || desc.name;
+    const match = findProfileMatch(el);
+    const entry = buttonMap.get(el);
+    if (!match) {
+      toast('No saved value matches "' + display + '".');
+      if (entry) entry.fillBtn.classList.add("jtk-ff-dim");
+      return;
+    }
+    // Deliberate unconditional overwrite (no isFilled guard): the per-field
+    // fill is an explicit override, unlike fill-page. No toast on success —
+    // the visible value change is the feedback.
+    fillField(el, match.entry.value);
+    if (entry) {
+      entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
+      entry.fillBtn.classList.remove("jtk-ff-dim");
+    }
+  }
+
+  // Wrappers are tracked per element (form fields are stable elements, unlike
+  // LinkedIn's recycled cards), so repeated scans reuse the same buttons.
+  let buttonMap = new WeakMap();
+
+  // Reflect the profile-match state on the fill button only (dim + tooltip
+  // naming the matched profile key); the add button never changes.
+  function updateButtonState(entry, el) {
+    const match = findProfileMatch(el);
+    if (match) {
+      entry.fillBtn.classList.remove("jtk-ff-dim");
+      entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
+    } else {
+      entry.fillBtn.classList.add("jtk-ff-dim");
+      entry.fillBtn.title = "Fill this field from profile";
+    }
+  }
+
+  // Vertically center the button pair on the field's row. The wrapper is a
+  // zero-height FLEX container, so its top edge sits just below the field (at
+  // the field's bottom edge, plus any bottom margin the field carries), and
+  // align-items:center pins the 18px pair exactly on that y=0 line — no line
+  // box, no baseline offset. A negative top of -(fieldH/2 + margin) lifts the
+  // pair so it spans the field's vertical middle. Relative positioning only
+  // moves painted content, so the wrapper's zero in-flow footprint is
+  // unaffected and following fields are never pulled up or down.
+  function positionButtons(entry, el) {
+    // Layout measurement (browser only): jsdom reports 0, so fall back to a
+    // nominal 40px field — the negative top must ALWAYS be applied.
+    const measured = el.getBoundingClientRect().height;
+    const fieldH = measured > 0 ? measured : 40;
+    let marginBottom = 0;
+    const view = el.ownerDocument ? el.ownerDocument.defaultView : null;
+    if (view && typeof view.getComputedStyle === "function") {
+      const mb = parseFloat(view.getComputedStyle(el).marginBottom);
+      if (isFinite(mb) && mb > 0) marginBottom = Math.min(mb, 40);
+    }
+    entry.wrapper.style.top = -Math.round(fieldH / 2 + marginBottom) + "px";
+  }
+
+  function ensureButtons(el, doc) {
+    let entry = buttonMap.get(el);
+    if (entry && entry.wrapper && entry.wrapper.isConnected) {
+      updateButtonState(entry, el);
+      positionButtons(entry, el);
+      return;
+    }
+    if (entry && entry.wrapper) {
+      entry.wrapper.remove();
+      buttonMap.delete(el);
+    }
+    entry = createButtons(el, doc);
+    buttonMap.set(el, entry);
+    updateButtonState(entry, el);
+    const parent = el.parentNode;
+    if (parent) parent.insertBefore(entry.wrapper, el.nextSibling);
+    positionButtons(entry, el);
+  }
+
+  // ------------------------------------------------------------------
+  // Scanning + page lifecycle
+  // ------------------------------------------------------------------
+
+  function scanPage() {
+    if (!window.jobAppToolkit.content.isModuleActive(MODULE_ID) || !isWhitelisted()) {
+      teardown();
+      return;
+    }
+    // Walk same-origin iframe documents exactly like collectFilledFieldsAll
+    // does, WITHOUT force: frames that carry their own content script are
+    // marked data-jtk-injected and skipped (they render their own buttons),
+    // while unmarked frames — where Firefox did not inject a script — are
+    // rendered into by this frame. Each document gets its own stylesheet and
+    // its own wrapper set.
+    forEachSameOriginDoc((doc) => {
+      injectStyles(doc);
+      const fields = discoverFields(doc);
+      for (const field of fields) ensureButtons(field.el, doc);
+    });
+  }
+
+  function teardown() {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    clearTimeout(scanTimer);
+    // Remove wrappers + stylesheet from every document this frame rendered
+    // into (this document and unmarked same-origin iframes), since unmarked
+    // frames have no content script of their own to clean up. Marked frames
+    // tear down through their own script. forEachSameOriginDoc swallows
+    // per-document errors, so the walk is safe even when a frame is gone.
+    forEachSameOriginDoc((doc) => {
+      const wrappers = doc.querySelectorAll("." + BTN_WRAPPER_CLASS);
+      for (const w of wrappers) w.remove();
+      const style = doc.getElementById(STYLE_ID);
+      if (style) style.remove();
+    });
+    buttonMap = new WeakMap();
+  }
+
+  let observer = null;
+  let scanTimer = null;
+
+  function scheduleScan() {
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(scanPage, 150);
+  }
+
+  function startObserving() {
+    if (observer) observer.disconnect();
+    const target = document.body || document.documentElement;
+    if (!target) return;
+    try {
+      observer = new MutationObserver(scheduleScan);
+      observer.observe(target, { childList: true, subtree: true });
+    } catch (err) {
+      observer = null;
+    }
+  }
+
+  // Late-loading safety net: form iframes can be created after the initial
+  // scan, and a top-document MutationObserver never crosses document
+  // boundaries. A cheap periodic tick re-scans everything (scanPage
+  // self-tears-down when the module is off or the page is not whitelisted).
+  function pollTick() {
+    try {
+      scanPage();
+    } catch (err) {
+      // Never fatal.
+    }
+  }
+
+  async function ensureActive() {
+    if (!window.jobAppToolkit.content.isModuleActive(MODULE_ID)) {
+      teardown();
+      return;
+    }
+    await loadConfig();
+    startObserving();
+    scanPage();
+  }
+
+  // ------------------------------------------------------------------
+  // AI spinner
+  // ------------------------------------------------------------------
+  //
+  // While an "Answer with AI" request is pending, the background asks this
+  // frame to show a small ring spinner on the field about to be filled (no
+  // toast — the spinner IS the feedback). It is a single fixed-position
+  // element, one per document, anchored to the field by getBoundingClientRect
+  // so the field's own styles are never mutated. The element is created in the
+  // field's OWNER document — which is also the frame the message landed in —
+  // so the same code serves fields inside same-origin iframes (position:fixed
+  // is viewport-relative, and the iframe's viewport moves with the iframe, so
+  // the spinner stays glued to the field even when the parent page scrolls).
+  //
+  // The spinner is purely message-driven (show:true → render, show:false →
+  // remove). teardown() deliberately does NOT touch it: the AI flow also runs
+  // on non-whitelisted pages, where scanPage's 2s poll calls teardown() on
+  // every tick, which would kill an in-flight spinner.
+  //
+  // Stable contract for the harness: element is div.jtk-ff-spinner with
+  // aria-hidden="true", created in the target field's document with inline
+  // left/top; the CSS lives in a #jtk-form-filler-spinner-styles <style> in
+  // the same document (.jtk-ff-spinner rule + @keyframes jtk-ff-spin) and is
+  // removed when the spinner hides.
+
+  let spinnerEl = null;       // the visible ring, if any
+  let spinnerField = null;    // the field the ring tracks
+  let spinnerTimer = null;    // rAF id (or stub-safe timeout id) of the loop
+  let spinnerLastTick = 0;    // clock of the last loop tick, for the rAF guard
+  let spinnerPlaced = false;  // false until the first position is set
+  let spinnerShownAt = 0;     // clock value when the ring appeared, for the max-age watchdog
+
+  // Spinner CSS is its own <style> — not the button stylesheet — because the
+  // AI flow also runs on non-whitelisted pages where the button styles are
+  // never injected. It is created on demand in the field's document and
+  // removed again on hide.
+  function injectSpinnerStyles(doc) {
+    const root = doc || document;
+    if (root.getElementById(SPINNER_STYLE_ID)) return;
+    const style = root.createElement("style");
+    style.id = SPINNER_STYLE_ID;
+    style.textContent =
+      // Border-trick ring: a light full border with a colored arc on top that
+      // rotates. position:fixed anchors it to the field's viewport; opacity
+      // comes from the semi-transparent track + solid arc. pointer-events:none
+      // keeps every interaction on the page underneath, and the z-index sits
+      // just below the core toast layer (2147483647) so a toast can always
+      // paint above it.
+      ".jtk-ff-spinner{position:fixed;width:14px;height:14px;box-sizing:border-box;border:2px solid rgba(0,0,0,.18);border-top-color:#2563eb;border-radius:50%;pointer-events:none;z-index:2147483000;animation:jtk-ff-spin .7s linear infinite;}" +
+      "@keyframes jtk-ff-spin{to{transform:rotate(360deg)}}";
+    (root.head || root.documentElement).appendChild(style);
+  }
+
+  function positionSpinner() {
+    if (!spinnerEl || !spinnerField) return;
+    try {
+      if (!spinnerField.isConnected) return; // field gone mid-flight: keep the last spot
+      const rect = spinnerField.getBoundingClientRect();
+      const view = spinnerEl.ownerDocument.defaultView || window;
+      const vw = view.innerWidth || 0;
+      const vh = view.innerHeight || 0;
+      // Treat an unknown viewport size (0) as "everything is on-screen" so a
+      // layout-less environment still gets a position; otherwise bail out and
+      // keep the last on-screen position once the field scrolls away.
+      const onScreen =
+        (vw <= 0 || (rect.left < vw && rect.right > 0)) &&
+        (vh <= 0 || (rect.top < vh && rect.bottom > 0));
+      if (spinnerPlaced && !onScreen) return;
+      spinnerPlaced = true;
+      // Park the ring at the field's top-left corner, inset 6px from the
+      // corner so the 14px ring sits fully inside the visible box (the input
+      // caret and first characters start further in). pointer-events:none
+      // keeps typing/interaction unaffected even though it overlays text.
+      spinnerEl.style.left = Math.round(rect.left + 6) + "px";
+      spinnerEl.style.top = Math.round(rect.top + 6) + "px";
+    } catch (err) {
+      // Never fatal.
+    }
+  }
+
+  function trackSpinner() {
+    if (!spinnerEl) return; // hidden while a callback was queued: loop ends
+    positionSpinner();
+    const view = spinnerEl.ownerDocument.defaultView || window;
+    const now = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+    // Max-age watchdog: if the ring has been up longer than the background's
+    // whole AI flow could possibly last, the hide message is never coming
+    // (background died, extension reloaded mid-flight). Clean up instead of
+    // leaving a phantom spinner anchored to a field forever.
+    if (now - spinnerShownAt > SPINNER_MAX_AGE_MS) {
+      hideAiSpinner();
+      return;
+    }
+    // Normal browsers fire rAF once per frame (~16ms), so the loop always
+    // reschedules via rAF. If an environment fires rAF synchronously (some
+    // test stubs), the elapsed time is tiny and we fall back to a macrotask
+    // so the loop can never recurse synchronously.
+    const viaRaf = now - spinnerLastTick >= 8;
+    spinnerLastTick = now;
+    spinnerTimer = viaRaf
+      ? view.requestAnimationFrame(trackSpinner)
+      : view.setTimeout(trackSpinner, 16);
+  }
+
+  function showAiSpinner(el) {
+    hideAiSpinner(); // replace any spinner already showing
+    const doc = el.ownerDocument || document;
+    injectSpinnerStyles(doc);
+    const holder = doc.body || doc.documentElement;
+    if (!holder) return;
+    spinnerEl = doc.createElement("div");
+    spinnerEl.className = SPINNER_CLASS;
+    spinnerEl.setAttribute("aria-hidden", "true");
+    holder.appendChild(spinnerEl);
+    spinnerField = el;
+    positionSpinner();
+    const view = doc.defaultView || window;
+    view.addEventListener("scroll", positionSpinner, true);
+    view.addEventListener("resize", positionSpinner, true);
+    spinnerShownAt = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+    trackSpinner();
+  }
+
+  function hideAiSpinner() {
+    if (spinnerTimer !== null) {
+      const view =
+        (spinnerEl && spinnerEl.ownerDocument.defaultView) ||
+        (spinnerField && spinnerField.ownerDocument && spinnerField.ownerDocument.defaultView) ||
+        window;
+      // One of the two is the right cancel for the stored id; the other is a
+      // guaranteed no-op, so calling both is safe either way.
+      view.cancelAnimationFrame(spinnerTimer);
+      view.clearTimeout(spinnerTimer);
+      spinnerTimer = null;
+    }
+    if (spinnerEl) {
+      const doc = spinnerEl.ownerDocument;
+      const view = doc.defaultView || window;
+      view.removeEventListener("scroll", positionSpinner, true);
+      view.removeEventListener("resize", positionSpinner, true);
+      if (spinnerEl.parentNode) spinnerEl.parentNode.removeChild(spinnerEl);
+      const style = doc.getElementById(SPINNER_STYLE_ID);
+      if (style) style.remove();
+      spinnerEl = null;
+    }
+    spinnerField = null;
+    spinnerPlaced = false;
+    spinnerShownAt = 0;
+  }
+
+  function handleAiSpinner(show, targetElementId) {
+    if (!show) {
+      hideAiSpinner();
+      return { ok: true };
+    }
     const el = resolveFieldElement(targetElementId);
-    if (!el) return { filled: 0, skipped: 0, unmatched: 0, noField: true };
-
-    const entries = buildMatchEntries(fields);
-    const matches = matchFields(entries, [{ el, candidates: getCandidates(el) }]);
-    if (matches.length === 0) {
-      return { filled: 0, skipped: 0, unmatched: entries.length };
-    }
-    const m = matches[0];
-    const isCheckbox = el.type === "checkbox";
-    const isFilled = isCheckbox
-      ? el.checked === isTruthyBoolean(m.entry.value)
-      : el.value !== "";
-    if (!overwrite && isFilled) {
-      return { filled: 0, skipped: 1, unmatched: 0 };
-    }
-    if (fillField(el, m.entry.value)) {
-      return { filled: 1, skipped: 0, unmatched: 0, key: m.key };
-    }
-    return { filled: 0, skipped: 1, unmatched: 0, key: m.key };
+    if (!el) return { ok: false };
+    showAiSpinner(el);
+    return { ok: true };
   }
 
-  // In-page confirmation toast, injected into the page so feedback never
-  // depends on OS desktop notifications. A new toast replaces any previous one.
-  let toastEl = null;
-  function showToast(text) {
-    if (!text) return;
-    if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
-    toastEl = document.createElement("div");
-    toastEl.setAttribute("role", "status");
-    toastEl.textContent = text;
-    Object.assign(toastEl.style, {
-      position: "fixed",
-      top: "16px",
-      left: "50%",
-      transform: "translateX(-50%)",
-      zIndex: "2147483647",
-      maxWidth: "80vw",
-      boxSizing: "border-box",
-      padding: "10px 16px",
-      borderRadius: "8px",
-      background: "#1f2937",
-      color: "#ffffff",
-      fontSize: "13px",
-      fontFamily: "system-ui, -apple-system, sans-serif",
-      lineHeight: "1.4",
-      boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
-      pointerEvents: "none",
-      opacity: "0",
-      transition: "opacity 0.2s ease"
+  // ------------------------------------------------------------------
+  // Wiring
+  // ------------------------------------------------------------------
+
+  try {
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area !== "sync" || !changes[STORAGE_KEY]) return;
+      ensureActive();
     });
-    (document.body || document.documentElement).appendChild(toastEl);
-    requestAnimationFrame(() => {
-      toastEl.style.opacity = "1";
-    });
-    setTimeout(() => {
-      if (!toastEl || !toastEl.parentNode) return;
-      toastEl.style.opacity = "0";
-      setTimeout(() => {
-        if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
-      }, 200);
-    }, 3500);
+  } catch (err) {
+    // Never fatal (e.g. harness stubs without storage.onChanged).
   }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", ensureActive);
+  } else {
+    ensureActive();
+  }
+  setInterval(pollTick, 2000);
 
   browser.runtime.onMessage.addListener((message) => {
     if (!message || typeof message.type !== "string") return undefined;
 
-    // Activity toggle broadcast from the background — update the cached flag
-    // without needing a storage read.
+    // Module activity broadcasts (jtk:*) are also handled by core/content.js
+    // (it caches the active flag); here we attach or tear down the in-page
+    // buttons in response to a toggle.
     if (message.type === "jtk:moduleActivityChanged") {
-      if (message.id === MODULE_ID) moduleActive = Boolean(message.active);
+      if (message.id === MODULE_ID) {
+        if (message.active) ensureActive();
+        else teardown();
+      }
       return undefined;
     }
 
-    // In-page feedback from the background (works regardless of module state).
-    if (message.type === "jtk:showToast") {
-      const text = message.title ? message.title + ": " + message.message : message.message;
-      showToast(text);
+    // Core message types (jtk:*) — activity broadcasts and toasts — are
+    // handled by core/content.js. This content script only serves its own
+    // module's (prefixed) messages.
+    if (
+      !window.jobAppToolkit.content.isModuleActive(MODULE_ID) ||
+      message.type.indexOf(MODULE_ID + ":") !== 0
+    ) {
       return undefined;
     }
-
-    // This content script only serves its own module's (prefixed) messages.
-    if (!moduleActive || message.type.indexOf(MODULE_ID + ":") !== 0) return undefined;
     const type = message.type.slice(MODULE_ID.length + 1);
 
     if (type === "fillPage") {
@@ -789,10 +1295,34 @@ function fillPageAll(activeProfile, force) {
     if (type === "collectFields") {
       return Promise.resolve(collectFilledFieldsAll(message.profileFields, message.force === true));
     }
-    if (type === "fillFocusedField") {
-      return Promise.resolve(
-        fillFocusedField(message.fields, Boolean(message.overwrite), message.targetElementId)
-      );
+    if (type === "getAIFieldInfo") {
+      const el = resolveFieldElement(message.targetElementId);
+      if (!el) {
+        return Promise.resolve({
+          ok: false,
+          error: "No fillable field at the right-clicked element."
+        });
+      }
+      return Promise.resolve(describeAIField(el));
+    }
+    if (type === "fillAIField") {
+      const el = resolveFieldElement(message.targetElementId);
+      if (!el) {
+        return Promise.resolve({
+          ok: false,
+          error: "The field is no longer available on this page."
+        });
+      }
+      if (el.tagName === "SELECT" || el.type === "checkbox") {
+        return Promise.resolve({ ok: false, error: "Not a text field." });
+      }
+      setNativeValue(el, String(message.value == null ? "" : message.value));
+      return Promise.resolve({ ok: true });
+    }
+    if (type === "aiSpinner") {
+      // Background signals the AI answer is in flight: show the ring on the
+      // target field (or clear it once the answer lands).
+      return Promise.resolve(handleAiSpinner(message.show !== false, message.targetElementId));
     }
     return undefined;
   });
