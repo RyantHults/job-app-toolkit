@@ -59,19 +59,21 @@ Per-site company controls for job search listings. Ships a LinkedIn adapter that
 - **Title keywords** — a per-site keyword list; any posting whose title contains one of the keywords is hidden like a blocked company (matching is case/punctuation-insensitive substring matching on the job title).
 - **Filter button** — every job title gets a small funnel button (styled like the block/highlight buttons) that opens an in-page prompt prefilled with that posting's title; confirming adds the keyword to the filter list.
 - **Hide applied** — an options toggle that hides postings LinkedIn marks as already applied to. Detection uses centralized applied-markers selectors plus a guarded short-badge text fallback, so titles/companies like "Applied Scientist" or "Applied Materials" never trigger it.
+- **Glassdoor ratings** — an options toggle (off by default) that adds a small `★ 4.4` badge beside each company name. The badge shows the company's overall Glassdoor rating with the review count on hover; clicking it opens the company's Glassdoor page in a new tab. Ratings are fetched in the background, cached aggressively (90 days on success, 7 days on failure), and silently skip hidden cards. A failed fetch shows a `?` badge instead — click it to retry.
 - **Undo toast** — blocking raises a toast with an Undo button; tapping it unblocks and restores the card immediately.
-- **Options page** — global on/off toggle, Blocked and Highlighted company lists, the Hidden title keywords list, and a Hide-applied switch.
-- **Sync + live** — per-site lists live under `sites.linkedin` in sync storage; changes apply to all open tabs instantly via `storage.onChanged`.
+- **Options page** — global on/off toggle, Blocked and Highlighted company lists, the Hidden title keywords list, a Hide-applied switch, and the Show Glassdoor ratings toggle.
+- **Sync + live** — per-site lists and the Glassdoor toggle live under `sites.linkedin` in sync storage; the rating cache lives in `browser.storage.local` and changes apply to all open tabs instantly via `storage.onChanged`.
 
 ### How it works
 
 - **Adapter pattern** — `currentAdapter()` matches the page (LinkedIn: `location.pathname` starts with `/jobs/search`) and exposes `findJobCards()` / `companyFromCard()`; adding a site means adding another adapter.
 - **Scan + observe** — cards are rescanned on load, storage change, a 2s poll, and DOM mutations (`childList` *and* `class` attribute changes, so re-renders re-apply within ~150ms).
-- **Click safety** — LinkedIn job cards are fully clickable, so button clicks call `preventDefault()`/`stopPropagation()` and the buttons are raised with `z-index`; otherwise clicking `⊘` (or the title filter funnel) bubbles into the card's own navigation handler and the hide is undone. The filter prompt is an overlay on `document.body`, outside any card, so its events never reach the card handlers.
+- **Click safety** — LinkedIn job cards are fully clickable, so button clicks call `preventDefault()`/`stopPropagation()` and the buttons are raised with `z-index`; otherwise clicking `⊘` (or the title filter funnel) bubbles into the card's own navigation handler and the hide is undone. The filter prompt is an overlay on `document.body`, outside any card, so its events never reach the card handlers. The Glassdoor badge uses the same z-index + stop-propagation pattern and opens the company page in a new tab on click.
+- **Glassdoor rating pipeline** — when the toggle is on, the content script debounces (250 ms) the unique on-screen company names and sends one `site-settings:glassdoor:getRatings` batch to the background. The background resolves each company against `api.glassdoor.com` (the API host is not behind Cloudflare — no cookie, no cold-start, no glassdoor tab required) via the typeahead → BFF → Overview-HTML pipeline, throttled (≥ 2 s gap, 15 per session) and cached (90 d success, 7 d failure). As each fetch completes, the background broadcasts `site-settings:glassdoor:updated` and the badge appears in-flow. A failed or zero-reviews result renders a `?` badge; clicking it sends `site-settings:glassdoor:retryRating` and the badge swaps to a spinner until the next broadcast resolves it. Cards that are already hidden (blocked company, title keyword, or hide-applied) are skipped entirely. Toggle off = zero requests and no badges.
 
 ### Storage
 
-`{ modules: { "site-settings": { active, sites: { linkedin: { blockedCompanies: [], highlightedCompanies: [], titleBlockedKeywords: [], hideApplied: false } } } } }`. Companies and keywords are stored verbatim and matched case/punctuation-insensitively; blocked and highlighted are mutually exclusive per company, the title keyword list is an independent filter (a match hides the card regardless of company state), and `hideApplied` is a per-site on/off that hides applied-marked cards like a block.
+`{ modules: { "site-settings": { active, sites: { linkedin: { blockedCompanies: [], highlightedCompanies: [], titleBlockedKeywords: [], hideApplied: false, showGlassdoorRatings: false } } } } }` plus `browser.storage.local` key `jtk-site-settings-glassdoor` → `{ [normalizedName]: { ok: true, rating, count, countText, pageUrl, employerId, schemaVersion, fetchedAt } | { ok: false, reason: "blocked" | "fetch_error" | "no_match" | "parse_error" | "no_reviews", schemaVersion, fetchedAt } }`. Companies and keywords are stored verbatim and matched case/punctuation-insensitively; blocked and highlighted are mutually exclusive per company, the title keyword list is an independent filter (a match hides the card regardless of company state), `hideApplied` is a per-site on/off that hides applied-marked cards like a block, and `showGlassdoorRatings` (default `false`) gates the optional Glassdoor rating badge. The rating cache is keyed by normalized company name and lives in `storage.local` (the sync quota is a fixed 100 KiB). The `count` field is the K/M-abbreviated review count (e.g. `"70.7K"`); `countText` is `count + " reviews"`. `schemaVersion` lets future fetcher changes evict stale entries automatically.
 
 ## Architecture
 
@@ -101,6 +103,9 @@ node /tmp/opencode/jtk-test/linkedin-variants.js
 node /tmp/opencode/jtk-test/overlap-test.js
 node /tmp/opencode/jtk-test/site-settings.js
 node /tmp/opencode/jtk-test/site-settings-bg.js
+node /tmp/opencode/jtk-test/glassdoor-bg.js
+node /tmp/opencode/jtk-test/glassdoor-content.js
+node /tmp/opencode/jtk-test/glassdoor-options.js
 node /tmp/opencode/jtk-test/buttons-test.js
 node /tmp/opencode/jtk-test/buttons-bg.js
 node /tmp/opencode/jtk-test/ai-content.js

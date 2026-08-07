@@ -6,6 +6,13 @@
 // hiding postings by title keyword. Lists persist in sync storage and
 // propagate to every open tab via storage.onChanged.
 //
+// An optional per-site toggle (sites.linkedin.showGlassdoorRatings) renders a
+// small Glassdoor rating badge (★ 4.4) in flow next to the company name.
+// Ratings are fetched from the background via site-settings:glassdoor:getRatings
+// (names are collected on each scan and debounced into one request) and kept
+// fresh through site-settings:glassdoor:updated broadcasts; the badge is
+// rendered only once a rating entry actually arrives.
+//
 // Site-specific knowledge lives behind adapters ({ siteId, isTargetPage,
 // findJobCards, companyFromCard }) so future job boards slot in without
 // touching the driver below. Module activity and toasts come from
@@ -68,7 +75,9 @@
     // breaking dataset.company matching on every scan and isBlocked /
     // isHighlighted lookups. Read from a clone with our wrappers stripped.
     const clone = el.cloneNode(true);
-    for (const w of clone.querySelectorAll("." + BTN_WRAPPER_CLASS + ", ." + TITLE_BTN_WRAPPER_CLASS)) {
+    for (const w of clone.querySelectorAll(
+      "." + BTN_WRAPPER_CLASS + ", ." + TITLE_BTN_WRAPPER_CLASS + ", ." + GD_WRAPPER_CLASS
+    )) {
       w.remove();
     }
     let text = String(clone.textContent || "")
@@ -158,7 +167,8 @@
     blockedCompanies: [],
     highlightedCompanies: [],
     titleBlockedKeywords: [],
-    hideApplied: false
+    hideApplied: false,
+    showGlassdoorRatings: false
   };
 
   async function loadConfig() {
@@ -173,14 +183,16 @@
         titleBlockedKeywords: Array.isArray(site.titleBlockedKeywords)
           ? site.titleBlockedKeywords
           : [],
-        hideApplied: site.hideApplied === true
+        hideApplied: site.hideApplied === true,
+        showGlassdoorRatings: site.showGlassdoorRatings === true
       };
     } catch (err) {
       config = {
         blockedCompanies: [],
         highlightedCompanies: [],
         titleBlockedKeywords: [],
-        hideApplied: false
+        hideApplied: false,
+        showGlassdoorRatings: false
       };
     }
   }
@@ -238,6 +250,8 @@
   const STYLE_ID = "jtk-site-settings-styles";
   const BTN_WRAPPER_CLASS = "jtk-ss-btns";
   const TITLE_BTN_WRAPPER_CLASS = "jtk-ss-title-btns";
+  const GD_WRAPPER_CLASS = "jtk-ss-gd";
+  const GD_PENDING_CLASS = "jtk-ss-gd-pending";
 
   function injectStyles() {
     if (document.getElementById(STYLE_ID)) return;
@@ -261,6 +275,24 @@
       ".jtk-ss-btn.jtk-ss-btn-active{opacity:1;}" +
       ".jtk-ss-btn.jtk-ss-hl.jtk-ss-btn-active{color:#b45309;}" +
       ".jtk-ss-btn.jtk-ss-blk.jtk-ss-btn-active{color:#b91c1c;}" +
+      // Glassdoor rating badge: painted above the card navigation overlay just
+      // like the buttons (high z-index + explicit pointer-events:auto).
+      ".jtk-ss-gd{display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;font-size:12px;line-height:1;color:#0caa41;text-decoration:none;cursor:pointer;opacity:.85;position:relative;z-index:1000;pointer-events:auto;}" +
+      ".jtk-ss-gd:hover{opacity:1;text-decoration:underline;}" +
+      ".jtk-ss-gd-pending{color:#9ca3af;cursor:default;text-decoration:none;}" +
+      ".jtk-ss-gd-pending:hover{text-decoration:none;}" +
+      // Failed badge ("?"): gray, clickable, sends a retry request to the
+      // background. Same z-index/pointer-events as the success badge so the
+      // card overlay doesn't eat the click.
+      ".jtk-ss-gd-failed{color:#9ca3af;cursor:pointer;text-decoration:none;}" +
+      ".jtk-ss-gd-failed:hover{opacity:1;color:#6b7280;}" +
+      // Retrying state: a small CSS-only spinner (no image, no font glyph)
+      // shown from the moment the user clicks "?" until the background's
+      // retry broadcast resolves the badge.
+      ".jtk-ss-gd-retrying{color:#9ca3af;cursor:default;text-decoration:none;display:inline-flex;align-items:center;}" +
+      ".jtk-ss-gd-retrying:hover{text-decoration:none;}" +
+      "@keyframes jtk-ss-gd-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}" +
+      ".jtk-ss-gd-spinner{display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:jtk-ss-gd-spin 0.8s linear infinite;}" +
       ".jtk-ss-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:2147483000;}" +
       ".jtk-ss-modal-card{background:#ffffff;border-radius:8px;padding:16px;width:min(360px,calc(100vw - 32px));box-shadow:0 4px 12px rgba(0,0,0,.15);font:13px/1.4 system-ui,-apple-system,'Segoe UI',sans-serif;color:#111827;box-sizing:border-box;}" +
       ".jtk-ss-modal-label{display:block;margin:0 0 8px 0;color:#111827;}" +
@@ -408,6 +440,271 @@
     } else {
       const parent = company.el.parentNode;
       if (parent) parent.insertBefore(btnSet.wrapper, company.el.nextSibling);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Glassdoor rating badges (optional per-site feature)
+  // ------------------------------------------------------------------
+
+  // Ratings live in the background (which owns the cache and the fetch); this
+  // content side only (a) throttles the unique on-screen company names into one
+  // debounced getRatings request and (b) renders/updates badges from the batch
+  // response and from site-settings:glassdoor:updated broadcasts. Resolved
+  // entries (ok:true or ok:false) are kept in a module-scoped cache so repeated
+  // scans (SPA re-renders, 2s poll) re-render from cache instead of re-asking.
+  const gdCache = new Map(); // gdNormalize(name) -> rating entry
+  const gdRetrying = new Set(); // gdNormalize(name) -> currently awaiting a retry result
+  let pendingNames = new Set();
+  let ratingRequestTimer = null;
+  let gdLastRequestedAt = 0;
+  let gdBroadcastListenerInstalled = false;
+
+  // Light normalization used for request dedup, dataset keys and broadcast
+  // matching. Deliberately NOT normalizeCompany(): the background looks names up
+  // as written, and companyText already trims/collapses whitespace.
+  function gdNormalize(name) {
+    return String(name)
+      .trim()
+      .replace(/\s+/g, " ");
+  }
+
+  // Cards (with their company info) whose name matches, so a batch response or
+  // a broadcast can re-render every card carrying that company. Re-runs the
+  // adapter's extraction rather than trusting our own wrappers: LinkedIn can
+  // wipe a badge wrapper on re-render, and the broadcast may arrive for a name
+  // whose card only appeared after our last scan.
+  function cardsForName(name) {
+    if (!adapter) return [];
+    const norm = gdNormalize(name);
+    const found = [];
+    for (const card of adapter.findJobCards(document)) {
+      const company = adapter.companyFromCard(card);
+      if (company && gdNormalize(company.name) === norm) {
+        found.push({ card: card, company: company });
+      }
+    }
+    return found;
+  }
+
+  // Renders (or re-renders) the inner content of a jtk-ss-gd wrapper: an <a>
+  // with "★ <rating>" for a resolved rating, a "?" button for a failed
+  // fetch (click to retry), or a pending "…" span for a not-yet-fetched entry.
+  function updateRatingBadge(wrapper, entry) {
+    wrapper.textContent = "";
+    // Any in-flight retry state is replaced by whatever this entry renders;
+    // the class must not linger and gray out a fresh green star or a "?".
+    wrapper.classList.remove("jtk-ss-gd-retrying");
+    if (entry.ok === false) {
+      // Failed fetch — render a "?" badge that retries on click. The retry
+      // message goes through the background, which evicts the failed cache
+      // entry and re-enqueues the fetch; a subsequent broadcast updates the
+      // badge in place (success → green, failure → stays "?").
+      wrapper.classList.remove(GD_PENDING_CLASS);
+      wrapper.classList.add("jtk-ss-gd-failed");
+      const btn = document.createElement("span");
+      btn.className = "jtk-ss-gd-retry";
+      btn.textContent = "?";
+      btn.title = (entry.reason ? "Glassdoor: " + entry.reason + " — click to retry" : "Glassdoor rating unavailable — click to retry");
+      btn.addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        // The company name for the retry must be the original LinkedIn string
+        // (the typeahead normalization is the background's concern). The
+        // wrapper's dataset.gdName is the normalized form, so we re-derive
+        // the original by scanning the cache key — simpler: just re-queue
+        // by sending the name from the cache entry's source. We don't have
+        // it here, so we send a sentinel that the retry handler ignores
+        // (it reads the cache to find the company). Instead: send the
+        // wrapper's gdName (normalized) — the background normalizes again
+        // (idempotent) and looks up + deletes the cache entry.
+        const retryName = wrapper.dataset.gdName || "";
+        if (!retryName) return;
+        // Track the retry and swap the "?" for a spinner immediately: the
+        // background's retry is throttled (serial queue, >=2s gap) and may sit
+        // behind other companies from the regular poll, so the user needs
+        // instant visual confirmation that the click registered. The spinner
+        // stays until the next broadcast for this name re-renders the badge.
+        gdRetrying.add(retryName);
+        updateRetrySpinner(wrapper);
+        browser.runtime
+          .sendMessage({ type: "site-settings:glassdoor:retryRating", name: retryName })
+          .catch(() => {});
+      });
+      wrapper.appendChild(btn);
+      return;
+    }
+    if (entry.ok !== true) {
+      wrapper.classList.add(GD_PENDING_CLASS);
+      const span = document.createElement("span");
+      span.textContent = "\u2026";
+      wrapper.appendChild(span);
+      return;
+    }
+    wrapper.classList.remove(GD_PENDING_CLASS);
+    wrapper.classList.remove("jtk-ss-gd-failed");
+    const rating = String(entry.rating);
+    const countText = entry.countText || (entry.count ? entry.count + " reviews" : "");
+    const pageUrl = entry.pageUrl || "";
+    const link = document.createElement("a");
+    link.textContent = "\u2605 " + rating;
+    link.href = pageUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = "Glassdoor rating: " + rating + (countText ? " \u2014 " + countText : "");
+    link.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (pageUrl) window.open(pageUrl, "_blank", "noopener,noreferrer");
+    });
+    wrapper.appendChild(link);
+  }
+
+  // Swaps a failed "?" badge for a CSS-only spinner while a retry is queued in
+  // the background. The wrapper keeps its .jtk-ss-gd identity (same placement,
+  // z-index and pointer-events), so scans and broadcasts can re-render it.
+  function updateRetrySpinner(wrapper) {
+    wrapper.textContent = "";
+    wrapper.classList.remove("jtk-ss-gd-failed");
+    wrapper.classList.add("jtk-ss-gd-retrying");
+    const spinner = document.createElement("span");
+    spinner.className = "jtk-ss-gd-spinner";
+    spinner.setAttribute("aria-label", "Retrying");
+    wrapper.appendChild(spinner);
+  }
+
+  // Inserts/updates the rating badge on a single card, keyed by company name
+  // via wrapper.dataset.gdName. Same in-flow placement logic as ensureButtons
+  // (block container vs inline sibling). No-op for a null entry; ok:false
+  // removes any badge previously rendered for this company on this card.
+  function ensureRatingBadge(card, company, ratingEntry) {
+    if (!ratingEntry || typeof ratingEntry !== "object") return;
+    const norm = gdNormalize(company.name);
+    let existing = card.querySelector("." + GD_WRAPPER_CLASS);
+    if (existing && existing.dataset.gdName !== norm) {
+      existing.remove();
+      existing = null;
+    }
+    if (ratingEntry.ok === false) {
+      // Failed fetch — render (or update) a "?" badge. The badge stays
+      // visible (doesn't auto-retry) and the user clicks it to retry.
+      if (existing) {
+        updateRatingBadge(existing, ratingEntry);
+        return;
+      }
+      const wrapper = document.createElement("span");
+      wrapper.className = GD_WRAPPER_CLASS;
+      wrapper.dataset.gdName = norm;
+      updateRatingBadge(wrapper, ratingEntry);
+      const tag = company.el.tagName;
+      if (tag === "DIV" || tag === "LI" || tag === "UL" || tag === "P" || tag === "SECTION" || tag === "ARTICLE") {
+        company.el.appendChild(wrapper);
+      } else {
+        const parent = company.el.parentNode;
+        if (parent) parent.insertBefore(wrapper, company.el.nextSibling);
+      }
+      return;
+    }
+    if (ratingEntry.ok !== true) {
+      // No definitive rating yet (not cached, not fetched): leave the company
+      // name alone until a response/broadcast arrives. Avoids a "…" flicker.
+      return;
+    }
+    if (existing) {
+      updateRatingBadge(existing, ratingEntry);
+      return;
+    }
+    const wrapper = document.createElement("span");
+    wrapper.className = GD_WRAPPER_CLASS;
+    wrapper.dataset.gdName = norm;
+    updateRatingBadge(wrapper, ratingEntry);
+    const tag = company.el.tagName;
+    if (tag === "DIV" || tag === "LI" || tag === "UL" || tag === "P" || tag === "SECTION" || tag === "ARTICLE") {
+      company.el.appendChild(wrapper);
+    } else {
+      const parent = company.el.parentNode;
+      if (parent) parent.insertBefore(wrapper, company.el.nextSibling);
+    }
+  }
+
+  function handleRatingsResponse(res) {
+    if (!res || !res.ratings || typeof res.ratings !== "object") return;
+    for (const name of Object.keys(res.ratings)) {
+      const entry = res.ratings[name];
+      gdCache.set(gdNormalize(name), entry);
+      for (const match of cardsForName(name)) {
+        ensureRatingBadge(match.card, match.company, entry);
+      }
+    }
+  }
+
+  // Sends one getRatings request for the accumulated names. No-op when the
+  // toggle is off or there is nothing to ask for.
+  function flushRatingRequests() {
+    ratingRequestTimer = null;
+    if (!adapter || !config.showGlassdoorRatings) return;
+    if (pendingNames.size === 0) return;
+    const names = Array.from(pendingNames);
+    pendingNames.clear();
+    gdLastRequestedAt = Date.now();
+    console.log("[Site Settings] glassdoor getRatings for:", names.join(", "));
+    browser.runtime
+      .sendMessage({ type: "site-settings:glassdoor:getRatings", names: names })
+      .then(handleRatingsResponse)
+      .catch((err) => {
+        console.error("[Site Settings] glassdoor getRatings failed:", err);
+      });
+  }
+
+  // Debounced collector: scanCards feeds the unique unseen names in, the flush
+  // fires 250ms after the last addition (dedup via pendingNames keeps repeated
+  // scans from resetting the timer once everything is already queued).
+  function queueRatingRequests(names) {
+    if (!config.showGlassdoorRatings) return;
+    for (const name of names) {
+      const norm = gdNormalize(name);
+      if (norm && !gdCache.has(norm)) pendingNames.add(norm);
+    }
+    if (pendingNames.size === 0) {
+      clearTimeout(ratingRequestTimer);
+      ratingRequestTimer = null;
+      return;
+    }
+    clearTimeout(ratingRequestTimer);
+    ratingRequestTimer = setTimeout(flushRatingRequests, 250);
+  }
+
+  function removeAllRatingBadges() {
+    clearTimeout(ratingRequestTimer);
+    ratingRequestTimer = null;
+    pendingNames.clear();
+    const wrappers = document.querySelectorAll("." + GD_WRAPPER_CLASS);
+    for (const w of Array.from(wrappers)) w.remove();
+  }
+
+  // Background broadcast: a single company's rating resolved (or failed).
+  function onGlassdoorUpdated(message) {
+    if (!adapter || !config.showGlassdoorRatings) return;
+    const name = message && message.name;
+    if (!name) return;
+    // A broadcast resolves any in-flight retry for this company; clear the
+    // retrying marker so the badge renders the fresh result (green ★ or "?")
+    // and the spinner never lingers.
+    gdRetrying.delete(gdNormalize(name));
+    const entry =
+      message.ok === true
+        ? {
+            ok: true,
+            rating: message.rating,
+            count: message.count,
+            countText: message.countText,
+            pageUrl: message.pageUrl,
+            employerId: message.employerId
+          }
+        : { ok: false };
+    gdCache.set(gdNormalize(name), entry);
+    for (const match of cardsForName(name)) {
+      ensureRatingBadge(match.card, match.company, entry);
     }
   }
 
@@ -564,6 +861,7 @@
       if (!c.isConnected) touchedCards.delete(c);
     }
     const cards = adapter.findJobCards(document);
+    const gdNames = [];
     for (const card of cards) {
       const title = adapter.titleFromCard(card);
       if (title) ensureFilterButton(card, title);
@@ -576,6 +874,35 @@
         title ? title.el : null
       );
       ensureButtons(card, company, state.blocked, state.highlighted);
+      if (config.showGlassdoorRatings) {
+        // Don't fetch or render ratings for cards that are already hidden
+        // (blocked company, title keyword match, or hideApplied). A card
+        // that became hidden after a rating was fetched also has its badge
+        // removed — the card is display:none so the badge wouldn't be seen,
+        // but removing it keeps the DOM clean and makes a future un-hide
+        // re-render the badge from the content-side cache.
+        if (state.blocked) {
+          const existing = card.querySelector("." + GD_WRAPPER_CLASS);
+          if (existing) existing.remove();
+        } else {
+          const cached = gdCache.get(gdNormalize(company.name));
+          if (cached) {
+            // While a retry is in flight the badge shows the spinner; a scan
+            // must not re-render the stale ok:false cache entry over it (the
+            // broadcast that resolves the retry owns the re-render).
+            if (!gdRetrying.has(gdNormalize(company.name))) {
+              ensureRatingBadge(card, company, cached);
+            }
+          } else {
+            gdNames.push(company.name);
+          }
+        }
+      }
+    }
+    if (config.showGlassdoorRatings) {
+      queueRatingRequests(gdNames);
+    } else {
+      removeAllRatingBadges();
     }
   }
 
@@ -611,6 +938,7 @@
       observer = null;
     }
     clearTimeout(scanTimer);
+    removeAllRatingBadges();
     const wrappers = document.querySelectorAll(
       "." + BTN_WRAPPER_CLASS + ",." + TITLE_BTN_WRAPPER_CLASS
     );
@@ -669,6 +997,19 @@
     }
     return undefined;
   });
+
+  // Glassdoor rating updates from the background. Installed exactly once; the
+  // handler re-checks the toggle and adapter so a broadcast arriving while the
+  // feature is off is a cheap no-op.
+  if (!gdBroadcastListenerInstalled) {
+    gdBroadcastListenerInstalled = true;
+    browser.runtime.onMessage.addListener((message) => {
+      if (message && message.type === "site-settings:glassdoor:updated") {
+        onGlassdoorUpdated(message);
+      }
+      return undefined;
+    });
+  }
 
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "sync" || !changes[STORAGE_KEY]) return;

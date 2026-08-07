@@ -9,6 +9,7 @@
 
   const activeToggle = document.getElementById("active-toggle");
   const hideAppliedToggle = document.getElementById("hide-applied-toggle");
+  const showGlassdoorToggle = document.getElementById("show-glassdoor-toggle");
   const blockedList = document.getElementById("blocked-list");
   const highlightedList = document.getElementById("highlighted-list");
   const keywordsList = document.getElementById("keyword-list");
@@ -20,13 +21,15 @@
   const HIGHLIGHTED_KEY = "highlightedCompanies";
   const KEYWORDS_KEY = "titleBlockedKeywords";
   const HIDE_APPLIED_KEY = "hideApplied";
+  const SHOW_GLASSDOR_KEY = "showGlassdoorRatings";
 
   let data = { active: true, sites: {} };
   let site = {
     [BLOCKED_KEY]: [],
     [HIGHLIGHTED_KEY]: [],
     [KEYWORDS_KEY]: [],
-    [HIDE_APPLIED_KEY]: false
+    [HIDE_APPLIED_KEY]: false,
+    [SHOW_GLASSDOR_KEY]: false
   };
 
   function ensureSite() {
@@ -37,6 +40,7 @@
     site[HIGHLIGHTED_KEY] = Array.isArray(site[HIGHLIGHTED_KEY]) ? site[HIGHLIGHTED_KEY] : [];
     site[KEYWORDS_KEY] = Array.isArray(site[KEYWORDS_KEY]) ? site[KEYWORDS_KEY] : [];
     site[HIDE_APPLIED_KEY] = site[HIDE_APPLIED_KEY] === true;
+    site[SHOW_GLASSDOR_KEY] = site[SHOW_GLASSDOR_KEY] === true;
   }
 
   async function loadData() {
@@ -45,6 +49,7 @@
     activeToggle.checked = data.active === true;
     ensureSite();
     hideAppliedToggle.checked = site[HIDE_APPLIED_KEY] === true;
+    showGlassdoorToggle.checked = site[SHOW_GLASSDOR_KEY] === true;
   }
 
   function saveData() {
@@ -152,6 +157,20 @@
         hideAppliedToggle.checked
           ? "Applied postings will be hidden."
           : "Applied postings will be shown."
+      );
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+  showGlassdoorToggle.addEventListener("change", async () => {
+    try {
+      site[SHOW_GLASSDOR_KEY] = showGlassdoorToggle.checked;
+      await saveData();
+      ui.setStatus(
+        showGlassdoorToggle.checked
+          ? "Glassdoor ratings will be shown."
+          : "Glassdoor ratings will be hidden."
       );
     } catch (err) {
       handleError(err);
