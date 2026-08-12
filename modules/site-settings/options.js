@@ -10,6 +10,10 @@
   const activeToggle = document.getElementById("active-toggle");
   const hideAppliedToggle = document.getElementById("hide-applied-toggle");
   const showGlassdoorToggle = document.getElementById("show-glassdoor-toggle");
+  const showPeopleCompanyToggle = document.getElementById("show-people-company-toggle");
+  const peopleCacheRow = document.querySelector(".people-cache-row");
+  const peopleCacheStats = document.getElementById("people-cache-stats");
+  const clearPeopleCacheBtn = document.getElementById("clear-people-cache-btn");
   const blockedList = document.getElementById("blocked-list");
   const highlightedList = document.getElementById("highlighted-list");
   const keywordsList = document.getElementById("keyword-list");
@@ -22,6 +26,8 @@
   const KEYWORDS_KEY = "titleBlockedKeywords";
   const HIDE_APPLIED_KEY = "hideApplied";
   const SHOW_GLASSDOR_KEY = "showGlassdoorRatings";
+  const SHOW_PEOPLE_COMPANY_KEY = "showPeopleSearchCompany";
+  const PEOPLE_CACHE_KEY = "jtk-site-settings-people";
 
   let data = { active: true, sites: {} };
   let site = {
@@ -29,7 +35,8 @@
     [HIGHLIGHTED_KEY]: [],
     [KEYWORDS_KEY]: [],
     [HIDE_APPLIED_KEY]: false,
-    [SHOW_GLASSDOR_KEY]: false
+    [SHOW_GLASSDOR_KEY]: false,
+    [SHOW_PEOPLE_COMPANY_KEY]: false
   };
 
   function ensureSite() {
@@ -41,6 +48,7 @@
     site[KEYWORDS_KEY] = Array.isArray(site[KEYWORDS_KEY]) ? site[KEYWORDS_KEY] : [];
     site[HIDE_APPLIED_KEY] = site[HIDE_APPLIED_KEY] === true;
     site[SHOW_GLASSDOR_KEY] = site[SHOW_GLASSDOR_KEY] === true;
+    site[SHOW_PEOPLE_COMPANY_KEY] = site[SHOW_PEOPLE_COMPANY_KEY] === true;
   }
 
   async function loadData() {
@@ -50,6 +58,34 @@
     ensureSite();
     hideAppliedToggle.checked = site[HIDE_APPLIED_KEY] === true;
     showGlassdoorToggle.checked = site[SHOW_GLASSDOR_KEY] === true;
+    showPeopleCompanyToggle.checked = site[SHOW_PEOPLE_COMPANY_KEY] === true;
+    await refreshPeopleCacheStats();
+  }
+
+  // Count how many entries are in the people company cache. We don't
+  // distinguish successes from failures here — both share the same
+  // storage slot, and a "Cached 12 / 3 failures" stat would be
+  // information overload for what is essentially a clear-cache button.
+  async function refreshPeopleCacheStats() {
+    if (!peopleCacheStats || !peopleCacheRow) return;
+    if (!showPeopleCompanyToggle.checked) {
+      peopleCacheRow.hidden = true;
+      return;
+    }
+    peopleCacheRow.hidden = false;
+    try {
+      const res = await browser.storage.local.get(PEOPLE_CACHE_KEY);
+      const cache = res[PEOPLE_CACHE_KEY];
+      const count = cache && typeof cache === "object" ? Object.keys(cache).length : 0;
+      peopleCacheStats.textContent =
+        count === 0
+          ? "No cached companies yet."
+          : count === 1
+          ? "1 cached company."
+          : count + " cached companies.";
+    } catch (err) {
+      peopleCacheStats.textContent = "(cache unavailable)";
+    }
   }
 
   function saveData() {
@@ -172,6 +208,37 @@
           ? "Glassdoor ratings will be shown."
           : "Glassdoor ratings will be hidden."
       );
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+  showPeopleCompanyToggle.addEventListener("change", async () => {
+    try {
+      site[SHOW_PEOPLE_COMPANY_KEY] = showPeopleCompanyToggle.checked;
+      await saveData();
+      ui.setStatus(
+        showPeopleCompanyToggle.checked
+          ? "People-search company lines will be shown."
+          : "People-search company lines will be hidden."
+      );
+      await refreshPeopleCacheStats();
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+  clearPeopleCacheBtn.addEventListener("click", async () => {
+    try {
+      const res = await browser.runtime.sendMessage({
+        type: "site-settings:people:clearCache"
+      });
+      if (res && res.ok) {
+        ui.setStatus("People-company cache cleared.");
+        await refreshPeopleCacheStats();
+      } else {
+        handleError(new Error((res && res.reason) || "clear failed"));
+      }
     } catch (err) {
       handleError(err);
     }

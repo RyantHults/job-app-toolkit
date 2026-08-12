@@ -31,15 +31,18 @@
   // notifications. Errors are ignored: the page may have no content script
   // (e.g. a browser-internal page). An optional `action` ({ type, label,
   // payload }) renders an action button on the toast; clicking it sends
-  // `{ type, ...payload }` back to the background.
-  function notify(tabId, title, message, action) {
+  // `{ type, ...payload }` back to the background. An optional `moduleId`
+  // identifies the originating module so module-specific debug features
+  // can filter toasts.
+  function notify(tabId, title, message, action, moduleId) {
     if (typeof tabId !== "number") return Promise.resolve(false);
     return browser.tabs
       .sendMessage(tabId, {
         type: "jtk:showToast",
         title: title || "",
         message: message || "",
-        action: action || null
+        action: action || null,
+        module: moduleId || ""
       })
       .then(
         () => true,
@@ -110,6 +113,11 @@
       throw new Error("jobAppToolkit.registerModule requires a module id");
     }
     modules[module.id] = module;
+    // Carry the optional export/import data hooks on the stored module object
+    // (they may be undefined for modules that don't implement them; the
+    // jtk:exportData / jtk:importData router cases read them from here).
+    modules[module.id].exportData = module.exportData;
+    modules[module.id].importData = module.importData;
   }
 
   // ------------------------------------------------------------------
@@ -202,6 +210,74 @@
             () => ({ ok: true }),
             () => ({ ok: false })
           );
+      }
+
+      case "jtk:exportData": {
+        const includeApiKey = Boolean(message.includeApiKey);
+        const exportedModules = {};
+        return Promise.all(
+          Object.values(modules).map(async (mod) => {
+            const active = await g.storage.isModuleActive(mod.id);
+            if (typeof mod.exportData === "function") {
+              const res = await mod.exportData(moduleApi(), {
+                includeApiKey: includeApiKey
+              });
+              exportedModules[mod.id] = {
+                active: active,
+                data: res.data,
+                local: res.local
+              };
+            } else {
+              const data = Object.assign({}, await g.storage.getModuleData(mod.id));
+              delete data.active;
+              exportedModules[mod.id] = { active: active, data: data, local: {} };
+            }
+          })
+        ).then(() => ({
+          ok: true,
+          export: {
+            format: "job-app-toolkit",
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            modules: exportedModules
+          }
+        }));
+      }
+
+      case "jtk:importData": {
+        const exp = message.export;
+        if (
+          !exp ||
+          exp.format !== "job-app-toolkit" ||
+          exp.version !== 1 ||
+          !exp.modules ||
+          typeof exp.modules !== "object" ||
+          Array.isArray(exp.modules)
+        ) {
+          return Promise.resolve({ ok: false, error: "Unsupported export format." });
+        }
+        const imported = [];
+        // Imports run sequentially: storage.js reads-modifies-writes the whole
+        // "jobAppToolkit" key per call, so parallel writes would lose updates.
+        return Object.keys(exp.modules).reduce(
+          (chain, id) =>
+            chain.then(async () => {
+              const exported = exp.modules[id];
+              const mod = modules[id];
+              try {
+                if (mod && typeof mod.importData === "function") {
+                  await mod.importData(moduleApi(), exported);
+                } else {
+                  await g.storage.setModuleData(id, exported.data || {});
+                  await g.storage.setModuleActive(id, Boolean(exported.active !== false));
+                }
+                imported.push(id);
+              } catch (err) {
+                console.error("Job App Toolkit: import failed for " + id, err);
+              }
+            }),
+          Promise.resolve()
+        ).then(() => ({ ok: true, imported: imported }));
       }
 
       default: {

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="applications.css">
+  <title>Application History — Job App Toolkit</title>
+</head>
+<body>
+  <h1>Application History</h1>
+  <p class="subtitle">Jobs you've submitted on whitelisted job boards.</p>
+
+  <!-- Application list -->
+  <section class="section" aria-label="Applications">
+    <div class="row">
+      <label for="sort-select" class="label">Sort by</label>
+      <select id="sort-select" aria-label="Sort applications">
+        <option value="date">Newest first</option>
+        <option value="company">Company A–Z</option>
+      </select>
+    </div>
+    <ul id="applications-list"></ul>
+  </section>
+
+  <!-- Status / result line -->
+  <p id="status" class="status" aria-live="polite"></p>
+
+  <!-- Inline modal overlay -->
+  <div id="modal-overlay" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="modal-input" type="text" hidden />
+      <div class="modal-actions">
+        <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="modal-confirm" class="btn btn-primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../../core/storage.js"></script>
+  <script src="../../core/ui.js"></script>
+  <script src="applications.js"></script>
+</body>
+</html>

@@ -36,6 +36,20 @@
     }
   }
 
+  // A stored field value may be a scalar string (single-answer fields) or an
+  // array of strings (multi-answer fields — checkbox groups, multi-selects).
+  // Arrays may legitimately be empty (every option deselected); when
+  // non-empty, every element must be a non-empty string.
+  function isValidFieldValue(value) {
+    if (typeof value === "string") return value !== "";
+    if (Array.isArray(value)) {
+      return value.every(function (el) {
+        return typeof el === "string" && el !== "";
+      });
+    }
+    return false;
+  }
+
   // The tab whose page the user is actually working on: the last-focused web
   // tab (kept by the core) so actions from the popup and from this module's
   // options page both land on the right tab. Falls back to the first web tab.
@@ -273,6 +287,43 @@ function skippedText(res) {
   // reach 180s before the spinner is hidden). Read at call/schedule time.
   const aiTimeouts = { call: 60000, flow: 90000 };
 
+  // ---- AI flow logging ----
+  // Every AI step logs to the extension (background) console under one short
+  // per-invocation id so a hang is traceable stage by stage. The same id is
+  // carried in every message sent to the page, so content-side logs (page
+  // console) line up with these. The API key and full answer text are never
+  // logged.
+  function aiLog(flowId, stage, detail) {
+    console.log(
+      "[Form Filler AI #" + flowId + " " + new Date().toISOString().slice(11, 23) + "] " +
+        stage +
+        (detail == null ? "" : ": " + detail)
+    );
+  }
+  function aiError(flowId, stage, detail) {
+    console.error(
+      "[Form Filler AI #" + flowId + " " + new Date().toISOString().slice(11, 23) + "] " +
+        stage +
+        (detail == null ? "" : ": " + detail)
+    );
+  }
+
+  // Log form of a captured subtitle: the picked-up text in quotes (never the
+  // full 800-char cap), truncated to 200 chars with a total-count suffix.
+  function subtitleLog(sub) {
+    const s = String(sub || "").trim();
+    if (!s) return "none";
+    return s.length > 200
+      ? '"' + s.slice(0, 200) + "…\" (" + s.length + " chars total)"
+      : '"' + s + '"';
+  }
+
+  function maskApiKey(key) {
+    if (!key) return "MISSING";
+    const s = String(key);
+    return s.slice(0, 6) + "\u2026" + s.slice(-2) + " (len " + s.length + ")";
+  }
+
   // Trim AI output to fit a field's maxlength: cut at the last whitespace run
   // before the limit when that lands mid-word (a word-boundary cut), else
   // hard-slice; never return a string longer than maxLength. A null maxLength
@@ -310,6 +361,7 @@ function skippedText(res) {
       })
       .join("\n");
     const questionText = fieldInfo.fieldLabel || fieldInfo.name || "";
+    const subtitleText = fieldInfo.subtitle ? String(fieldInfo.subtitle).trim() : "";
     const contextText = fieldInfo.pageTitle
       ? "Context: applying via " + fieldInfo.pageTitle
       : "";
@@ -327,6 +379,7 @@ function skippedText(res) {
     const lines = ["Background:"];
     if (backgroundText) lines.push(backgroundText);
     lines.push("", "Question: " + questionText);
+    if (subtitleText) lines.push("Additional context: " + subtitleText);
     if (contextText) lines.push(contextText);
     if (maxLengthText || singleLineText) {
       lines.push("Constraints:");
@@ -428,7 +481,8 @@ function skippedText(res) {
   // overall flow deadline abort this request too: if already aborted the
   // internal controller aborts immediately, else a listener forwards the
   // abort. Abort is idempotent, so it is safe if both timers fire.
-  async function callLLM(endpoint, apiKey, model, messages, maxTokens, temperature, signal) {
+  async function callLLM(endpoint, apiKey, model, messages, maxTokens, temperature, signal, logId, label) {
+    const step = label || "llm";
     const controller = new AbortController();
     const timer = setTimeout(function () {
       controller.abort();
@@ -442,6 +496,12 @@ function skippedText(res) {
         });
       }
     }
+    aiLog(
+      logId || "?",
+      "fetch " + step + " start",
+      "-> " + endpoint + " (model " + model + ", messages " + messages.length +
+        ", timeout " + aiTimeouts.call + "ms)"
+    );
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -464,6 +524,11 @@ function skippedText(res) {
         } catch (err) {
           // Keep the bare status line.
         }
+        aiError(
+          logId || "?",
+          "fetch " + step + " HTTP " + res.status,
+          snippet || "(no response body)"
+        );
         throw new Error("HTTP " + res.status + " \u2014 " + snippet);
       }
       const data = await res.json();
@@ -472,9 +537,20 @@ function skippedText(res) {
           ? data.choices[0].message.content
           : null;
       if (typeof content !== "string" || content.trim() === "") {
+        aiError(logId || "?", "fetch " + step + " empty answer", "response had no usable content");
         throw new Error("The API returned no answer.");
       }
+      aiLog(logId || "?", "fetch " + step + " ok", "HTTP " + res.status + ", " + content.length + " chars");
       return content.trim();
+    } catch (err) {
+      aiError(
+        logId || "?",
+        "fetch " + step + " threw",
+        err && err.name === "AbortError"
+          ? "aborted after " + aiTimeouts.call + "ms (endpoint did not respond)"
+          : String((err && err.message) || err).slice(0, 300)
+      );
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -509,73 +585,148 @@ function skippedText(res) {
   // field and toast the outcome. A spinner on the target field covers the AI
   // work. Text fields only; fills overwrite any existing text by design.
   async function answerFieldWithAI(info, tab, api) {
+    const flowId = Math.random().toString(36).slice(2, 8);
+    aiLog(
+      flowId,
+      "menu click",
+      "tab " + tab.id + ", frame " + (info.frameId == null ? 0 : info.frameId) +
+        ", target " + info.targetElementId
+    );
     const captured = await sendToContent(
       tab,
-      { type: "form-filler:getAIFieldInfo", targetElementId: info.targetElementId },
+      { type: "form-filler:getAIFieldInfo", flowId: flowId, targetElementId: info.targetElementId },
       info.frameId
     );
     if (!captured || !captured.ok) {
+      aiError(
+        flowId,
+        "capture failed",
+        (captured && captured.error) || "no response from the page (content script inactive in that frame?)"
+      );
       api.notify(
         tab.id,
         "Job App Toolkit",
-        (captured && captured.error) || "Could not read the field you right-clicked."
+        (captured && captured.error) || "Could not read the field you right-clicked.",
+        null,
+        "form-filler"
       );
       return;
     }
+    aiLog(
+      flowId,
+      "captured",
+      captured.tagName + " " + (captured.type || "") +
+        " name=" + (captured.name || "-") +
+        " label=" + (captured.fieldLabel || "-") +
+        " subtitle=" + subtitleLog(captured.subtitle) +
+        " maxLength=" + (captured.maxLength == null ? "none" : captured.maxLength) +
+        " singleLine=" + (captured.singleLine === true)
+    );
     if (captured.tagName === "SELECT" || captured.type === "checkbox") {
-      api.notify(tab.id, "Job App Toolkit", "AI can only fill text fields.");
+      aiLog(flowId, "abort: not a text field", captured.tagName + "/" + (captured.type || ""));
+      api.notify(tab.id, "Job App Toolkit", "AI can only fill text fields.", null, "form-filler");
       return;
     }
     const question = captured.fieldLabel || captured.name || "";
     if (!question) {
-      api.notify(tab.id, "Job App Toolkit", "Could not determine the question for this field.");
+      aiLog(flowId, "abort: no question text on the field");
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        "Could not determine the question for this field.",
+        null,
+        "form-filler"
+      );
       return;
     }
     const config = await readAIConfig(api);
     if (!config.apiKey) {
-      api.notify(tab.id, "Job App Toolkit", "Set your API key in the Form Filler options page.");
-      return;
-    }
-    if (!config.endpoint) {
-      api.notify(tab.id, "Job App Toolkit", "Set an API endpoint in the Form Filler options page.");
-      return;
-    }
-    if (!config.model) {
-      api.notify(tab.id, "Job App Toolkit", "Set a model in the Form Filler options page.");
-      return;
-    }
-    const usable = config.entries.some(
-      (e) => e && typeof e.body === "string" && e.body.trim() !== ""
-    );
-    if (!usable) {
+      aiLog(flowId, "abort: no API key configured", "set it in the Form Filler options page");
       api.notify(
         tab.id,
         "Job App Toolkit",
-        "Add your experience and projects in the Form Filler options page first."
+        "Set your API key in the Form Filler options page.",
+        null,
+        "form-filler"
       );
       return;
     }
-    api.notify(tab.id, "Job App Toolkit", 'Asking AI: "' + question + '"\u2026');
-    console.log(
-      "[Form Filler] AI request: " + config.endpoint + " (model " + config.model + ")"
+    if (!config.endpoint) {
+      aiLog(flowId, "abort: no endpoint configured", "set it in the Form Filler options page");
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        "Set an API endpoint in the Form Filler options page.",
+        null,
+        "form-filler"
+      );
+      return;
+    }
+    if (!config.model) {
+      aiLog(flowId, "abort: no model configured", "set it in the Form Filler options page");
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        "Set a model in the Form Filler options page.",
+        null,
+        "form-filler"
+      );
+      return;
+    }
+    const usableEntries = (Array.isArray(config.entries) ? config.entries : []).filter(
+      (e) => e && typeof e.body === "string" && e.body.trim() !== ""
     );
-    console.log(
-      "[Form Filler] AI capture: maxLength=" +
-        (captured.maxLength == null ? "none" : captured.maxLength) +
+    if (usableEntries.length === 0) {
+      aiLog(flowId, "abort: no usable background entries", "add them in the Form Filler options page");
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        "Add your experience and projects in the Form Filler options page first.",
+        null,
+        "form-filler"
+      );
+      return;
+    }
+    api.notify(
+      tab.id,
+      "Job App Toolkit",
+      'Asking AI: "' + question + '"\u2026',
+      null,
+      "form-filler"
+    );
+    aiLog(
+      flowId,
+      "config",
+      "endpoint " + config.endpoint +
+        " | model " + config.model +
+        " | apiKey " + maskApiKey(config.apiKey) +
+        " | entries " + usableEntries.length + " usable" +
         (config.instructions && config.instructions.trim()
           ? " | custom instructions (" + config.instructions.trim().length + " chars)"
           : " | default instructions")
     );
 
     const prompt = buildPrompt(config.entries, captured, config.instructions);
+    aiLog(
+      flowId,
+      "prompt built",
+      "question \u201c" + question + "\u201d | user message " + prompt.user.length +
+        " chars | system " + prompt.system.length + " chars"
+    );
     // Spinner on the target field while the AI work runs; hidden on every
     // terminal path below (API error, fill failure, success). It stays visible
     // across evaluation and the corrective retry (no hide between attempts).
     sendToContent(
       tab,
-      { type: "form-filler:aiSpinner", show: true, targetElementId: info.targetElementId },
+      {
+        type: "form-filler:aiSpinner",
+        show: true,
+        flowId: flowId,
+        targetElementId: info.targetElementId
+      },
       info.frameId
     );
+    aiLog(flowId, "spinner shown", "target " + info.targetElementId);
 
     // Overall flow deadline: the spinner must never sit through the full worst
     // case (generation + judge + retry, each up to aiTimeouts.call). The timer
@@ -587,6 +738,7 @@ function skippedText(res) {
       flowTimedOut = true;
       flowAbort.abort();
     }, aiTimeouts.flow);
+    aiLog(flowId, "flow deadline armed", aiTimeouts.flow + "ms");
 
     let text;
     let retries = 0;
@@ -602,7 +754,9 @@ function skippedText(res) {
           ],
           undefined,
           undefined,
-          flowAbort.signal
+          flowAbort.signal,
+          flowId,
+          "generate"
         );
 
         // Hybrid self-check: deterministic checks first, then an LLM judge,
@@ -623,21 +777,28 @@ function skippedText(res) {
               ],
               120,
               0,
-              flowAbort.signal
+              flowAbort.signal,
+              flowId,
+              "judge"
             );
             const res = parseJudgeResult(judge);
+            aiLog(
+              flowId,
+              "judge verdict",
+              res.pass ? "PASS" : "FAIL \u2014 " + String(res.reason || "").slice(0, 120)
+            );
             if (!res.pass) feedback = res.reason;
           } catch (err) {
             // Fail-open: a broken judge never blocks a usable answer — unless
             // the overall flow deadline fired, in which case surface the
             // timeout instead of filling the original answer.
             if (flowAbort.signal.aborted) throw err;
-            console.error("[Form Filler] AI judge failed (filling answer anyway):", err);
+            aiError(flowId, "judge failed (filling answer anyway)", err);
           }
         }
         if (feedback) {
           retries = 1;
-          console.log("[Form Filler] AI self-check failed, retrying: " + feedback.slice(0, 200));
+          aiLog(flowId, "self-check failed, retrying", feedback.slice(0, 200));
           const retryMessages = [
             { role: "system", content: prompt.system },
             { role: "user", content: prompt.user },
@@ -651,16 +812,29 @@ function skippedText(res) {
             retryMessages,
             undefined,
             undefined,
-            flowAbort.signal
+            flowAbort.signal,
+            flowId,
+            "retry"
           );
           const still = runDeterministicChecks(text, captured);
-          if (still.length) console.warn("[Form Filler] AI retry still violates: " + still.join("; "));
+          if (still.length) aiLog(flowId, "retry still violates", still.join("; "));
         }
       } catch (err) {
-        console.error("[Form Filler] AI answer failed:", err);
+        const failKind =
+          flowTimedOut === true
+            ? "flow deadline (" + Math.round(aiTimeouts.flow / 1000) + "s)"
+            : err && err.name === "AbortError"
+              ? "call timeout (" + aiTimeouts.call + "ms)"
+              : "error";
+        aiError(flowId, "answer flow failed [" + failKind + "]", String((err && err.message) || err).slice(0, 300));
         sendToContent(
           tab,
-          { type: "form-filler:aiSpinner", show: false, targetElementId: info.targetElementId },
+          {
+            type: "form-filler:aiSpinner",
+            show: false,
+            flowId: flowId,
+            targetElementId: info.targetElementId
+          },
           info.frameId
         );
         const msg =
@@ -669,21 +843,29 @@ function skippedText(res) {
             : err && err.name === "AbortError"
               ? "AI answer timed out \u2014 the endpoint did not respond."
               : "AI answer failed: " + String((err && err.message) || err).slice(0, 200);
-        api.notify(tab.id, "Job App Toolkit", msg);
+        api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
         return;
       }
 
       if (flowAbort.signal.aborted) {
         // Deadline fired between the last LLM call and the fill.
+        aiLog(flowId, "flow deadline reached before fill");
         sendToContent(
           tab,
-          { type: "form-filler:aiSpinner", show: false, targetElementId: info.targetElementId },
+          {
+            type: "form-filler:aiSpinner",
+            show: false,
+            flowId: flowId,
+            targetElementId: info.targetElementId
+          },
           info.frameId
         );
         api.notify(
           tab.id,
           "Job App Toolkit",
-          "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds."
+          "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds.",
+          null,
+          "form-filler"
         );
         return;
       }
@@ -691,43 +873,67 @@ function skippedText(res) {
       let answer = text;
       if (captured.singleLine) answer = answer.replace(/\r?\n/g, " "); // harden single-line
       answer = truncateForField(answer, captured.maxLength); // final truncation
-      console.log(
-        "[Form Filler] AI answer: " + text.length + " chars raw -> " + answer.length +
-          " chars after truncation (maxLength " +
+      aiLog(
+        flowId,
+        "answer ready",
+        text.length + " chars raw -> " + answer.length + " chars after truncation (maxLength " +
           (captured.maxLength == null ? "none" : captured.maxLength) + ")" +
           (retries ? " (retried 1x)" : "")
       );
       const filled = await sendToContent(
         tab,
-        { type: "form-filler:fillAIField", targetElementId: info.targetElementId, value: answer },
+        {
+          type: "form-filler:fillAIField",
+          flowId: flowId,
+          targetElementId: info.targetElementId,
+          value: answer
+        },
         info.frameId
       );
+      aiLog(flowId, "fill response", filled && filled.ok ? "ok" : JSON.stringify(filled));
       if (!filled || !filled.ok) {
-        console.warn("[Form Filler] fillAIField response:", filled);
+        aiError(flowId, "fill rejected by the page", (filled && filled.error) || "no response");
         sendToContent(
           tab,
-          { type: "form-filler:aiSpinner", show: false, targetElementId: info.targetElementId },
+          {
+            type: "form-filler:aiSpinner",
+            show: false,
+            flowId: flowId,
+            targetElementId: info.targetElementId
+          },
           info.frameId
         );
         api.notify(
           tab.id,
           "Job App Toolkit",
-          "Could not fill the field: " + ((filled && filled.error) || "field no longer available")
+          "Could not fill the field: " + ((filled && filled.error) || "field no longer available"),
+          null,
+          "form-filler"
         );
         return;
       }
       sendToContent(
         tab,
-        { type: "form-filler:aiSpinner", show: false, targetElementId: info.targetElementId },
+        {
+          type: "form-filler:aiSpinner",
+          show: false,
+          flowId: flowId,
+          targetElementId: info.targetElementId
+        },
         info.frameId
       );
-      console.log(
-        "[Form Filler] AI filled \"" + question + "\" (" + answer.length + " chars)."
+      aiLog(
+        flowId,
+        "filled",
+        "\u201c" + question + "\u201d (" + answer.length + " chars)" +
+          (answer.length < text.length ? " [truncated to fit]" : "")
       );
       api.notify(
         tab.id,
         "Job App Toolkit",
-        'Filled "' + question + '"' + (answer.length < text.length ? " (truncated to fit)." : ".")
+        'Filled "' + question + '"' + (answer.length < text.length ? " (truncated to fit)." : "."),
+        null,
+        "form-filler"
       );
     } finally {
       clearTimeout(flowTimer);
@@ -761,6 +967,147 @@ function skippedText(res) {
   }
 
   // ------------------------------------------------------------------
+  // Application tracking (logged applications, storage.local)
+  // ------------------------------------------------------------------
+
+  // Logged job applications live in browser.storage.local — bulky user data
+  // the sync quota can't hold, same pattern as the AI background entries. The
+  // stage vocabulary is shared with the history page (custom stages are also
+  // allowed).
+  const APPLICATIONS_LOCAL = "jtk-form-filler-applications";
+  const APPLICATION_STAGES = [
+    "applied",
+    "initial interview scheduled",
+    "round 1",
+    "round 2",
+    "round 3",
+    "round 4",
+    "offer received",
+    "offer accepted",
+    "rejected"
+  ];
+
+  async function readApplications() {
+    const res = await browser.storage.local.get(APPLICATIONS_LOCAL);
+    return Array.isArray(res[APPLICATIONS_LOCAL]) ? res[APPLICATIONS_LOCAL] : [];
+  }
+
+  async function writeApplications(list) {
+    await browser.storage.local.set({ [APPLICATIONS_LOCAL]: list });
+  }
+
+  // Normalize a title/company for job matching: lowercase, collapse every run
+  // of non-alphanumerics into a single space, trim (same semantics as the
+  // content side's normalize). A result of "" means "no match".
+  function normalizeJobText(text) {
+    return String(text == null ? "" : text)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  // Log an application from the content script. Merge rules, in order:
+  // 1. identical non-empty URL -> duplicate (no write, no toast);
+  // 2. same job (normalized title equal AND both companies empty OR normalized
+  //    companies equal) -> refresh appliedAt, keep the original url;
+  // 3. otherwise push a new entry and toast.
+  async function logApplicationAction(api, sender, info) {
+    info = info || {};
+    const url = typeof info.url === "string" ? info.url : "";
+    const title = typeof info.title === "string" ? info.title : "";
+    const company = typeof info.company === "string" ? info.company : "";
+    const list = await readApplications();
+
+    if (url !== "") {
+      const dup = list.find((e) => e && e.url === url);
+      if (dup) return { ok: true, action: "duplicate" };
+    }
+
+    const titleNorm = normalizeJobText(title);
+    const companyNorm = normalizeJobText(company);
+    if (titleNorm !== "") {
+      const match = list.find(function (e) {
+        if (!e) return false;
+        if (normalizeJobText(e.title) !== titleNorm) return false;
+        const eCompany = normalizeJobText(e.company);
+        if (companyNorm === "" && eCompany === "") return true;
+        return companyNorm !== "" && eCompany === companyNorm;
+      });
+      if (match) {
+        match.appliedAt = Date.now();
+        await writeApplications(list);
+        return { ok: true, action: "updated" };
+      }
+    }
+
+    const entry = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      title: title,
+      url: url,
+      company: company,
+      appliedAt: Date.now(),
+      stage: "applied"
+    };
+    list.push(entry);
+    await writeApplications(list);
+    if (sender && sender.tab && typeof sender.tab.id === "number") {
+      api.notify(sender.tab.id, "Job App Toolkit", "Application logged.", null, "form-filler");
+    }
+    return { ok: true, action: "created" };
+  }
+
+  // Popup quick action: open the application history page in a new tab.
+  async function openApplicationsHistory() {
+    const url = browser.runtime.getURL("modules/form-filler/applications.html");
+    await browser.tabs.create({ url: url });
+    return { ok: true };
+  }
+
+  async function getApplicationsAction() {
+    const applications = await readApplications();
+    return { ok: true, applications: applications, stages: APPLICATION_STAGES };
+  }
+
+  // Set an entry's stage (custom stages allowed); a missing id is a no-op.
+  async function setApplicationStageAction(message) {
+    const id = message.id;
+    const stage = typeof message.stage === "string" ? message.stage.trim() : "";
+    if (stage === "") return { ok: true };
+    const list = await readApplications();
+    const entry = list.find((e) => e && e.id === id);
+    if (entry) {
+      entry.stage = stage;
+      await writeApplications(list);
+    }
+    return { ok: true };
+  }
+
+  async function deleteApplicationAction(message) {
+    const id = message.id;
+    const list = await readApplications();
+    const next = list.filter((e) => !e || e.id !== id);
+    if (next.length !== list.length) {
+      await writeApplications(next);
+    }
+    return { ok: true };
+  }
+
+  // Set an entry's company label (a user correction when extraction grabbed
+  // the wrong name). Empty is allowed — it clears the label so the history
+  // row falls back to the job title / "Unknown company".
+  async function setApplicationCompanyAction(message) {
+    const id = message.id;
+    const company = typeof message.company === "string" ? message.company.trim() : "";
+    const list = await readApplications();
+    const entry = list.find((e) => e && e.id === id);
+    if (entry && entry.company !== company) {
+      entry.company = company;
+      await writeApplications(list);
+    }
+    return { ok: true };
+  }
+
+  // ------------------------------------------------------------------
   // Quick actions (popup) + request handlers (options page)
   // ------------------------------------------------------------------
 
@@ -782,7 +1129,7 @@ async function fillPageAction(api) {
     // responded. Shallow merge preserves profiles/activeProfile.
     await ensureDomainWhitelisted(api, tab, data);
     const msg = fillSummary(res);
-    api.notify(tab.id, "Job App Toolkit", msg);
+    api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
     return { ok: true, message: msg };
   }
 
@@ -801,7 +1148,7 @@ async function fillPageAction(api) {
     }
     const profile = data.profiles[profileName];
     const display = focused.fieldLabel || focused.name;
-    if (typeof focused.value !== "string" || focused.value === "") {
+    if (!isValidFieldValue(focused.value)) {
       return { ok: false, error: 'Field "' + display + '" is empty.' };
     }
     profile.fields = profile.fields || {};
@@ -814,7 +1161,7 @@ async function fillPageAction(api) {
       activeProfile: data.activeProfile
     });
     const msg = 'Captured "' + display + '".';
-    api.notify(tab.id, "Job App Toolkit", msg);
+    api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
     return { ok: true, message: msg };
   }
 
@@ -835,7 +1182,7 @@ async function fillPageAction(api) {
       return { ok: false, error: "Cannot read fields on this page." };
     }
     const msg = await mergeCollectedFields(api, data, profileName, res);
-    api.notify(tab.id, "Job App Toolkit", msg);
+    api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
     return { ok: true, message: msg };
   }
 
@@ -849,7 +1196,7 @@ async function fillPageAction(api) {
     if (typeof field.name !== "string" || field.name === "") {
       return { ok: false, error: "Field name is required." };
     }
-    if (typeof field.value !== "string" || field.value === "") {
+    if (!isValidFieldValue(field.value)) {
       return { ok: false, error: "Field value is required." };
     }
     const data = await api.getModuleData(MODULE_ID);
@@ -952,7 +1299,9 @@ async function fillPageAction(api) {
       api.notify(
         tab.id,
         "Job App Toolkit",
-        "No active profile. Open the Form Filler options page and create or select one."
+        "No active profile. Open the Form Filler options page and create or select one.",
+        null,
+        "form-filler"
       );
       return;
     }
@@ -961,22 +1310,28 @@ async function fillPageAction(api) {
     if (info.menuItemId === MENU.fillPage) {
       const res = await fillPageAcrossFrames(tab, profile.fields || {});
       if (!res) {
-        api.notify(tab.id, "Job App Toolkit", "Cannot fill on this page.");
+        api.notify(tab.id, "Job App Toolkit", "Cannot fill on this page.", null, "form-filler");
         return;
       }
       await ensureDomainWhitelisted(api, tab, data);
-      api.notify(tab.id, "Job App Toolkit", fillSummary(res));
+      api.notify(tab.id, "Job App Toolkit", fillSummary(res), null, "form-filler");
       return;
     }
 
     if (info.menuItemId === MENU.addAll) {
       const res = await collectFieldsFromTab(tab, profile.fields || {});
       if (!res) {
-        api.notify(tab.id, "Job App Toolkit", "Cannot read fields on this page.");
+        api.notify(
+          tab.id,
+          "Job App Toolkit",
+          "Cannot read fields on this page.",
+          null,
+          "form-filler"
+        );
         return;
       }
       const msg = await mergeCollectedFields(api, data, profileName, res);
-      api.notify(tab.id, "Job App Toolkit", msg);
+      api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
       return;
     }
   }
@@ -996,7 +1351,94 @@ async function fillPageAction(api) {
     if (message.type === "form-filler:addField") {
       return addFieldAction(api, message.field);
     }
+    if (message.type === "form-filler:logApplication") {
+      return logApplicationAction(api, sender, message);
+    }
+    if (message.type === "form-filler:getApplications") {
+      return getApplicationsAction();
+    }
+    if (message.type === "form-filler:setApplicationStage") {
+      return setApplicationStageAction(message);
+    }
+    if (message.type === "form-filler:deleteApplication") {
+      return deleteApplicationAction(message);
+    }
+    if (message.type === "form-filler:setApplicationCompany") {
+      return setApplicationCompanyAction(message);
+    }
     return undefined;
+  }
+
+  // ------------------------------------------------------------------
+  // Export / import (core feature)
+  // ------------------------------------------------------------------
+
+  // The sync payload minus the keys that must not travel with an export: the
+  // `active` flag (the core tracks that separately) and the legacy `aiContext`
+  // (the AI background entries live in storage.local now — mirroring
+  // readAIConfig, local is authoritative, so the sync copy is dropped).
+  function exportableData(payload) {
+    const out = {};
+    if (payload && typeof payload === "object") {
+      Object.keys(payload).forEach(function (k) {
+        if (k !== "active" && k !== "aiContext") out[k] = payload[k];
+      });
+    }
+    return out;
+  }
+
+  // Export the module config: the sync payload (no active flag, no legacy
+  // aiContext) plus the storage.local user data — the AI background entries
+  // always, the API key only when opts.includeApiKey is truthy and a key is
+  // actually stored. An absent key is omitted entirely, never exported empty.
+  async function exportData(api, opts) {
+    const data = exportableData(await api.getModuleData(MODULE_ID));
+    const [ctx, key, apps] = await Promise.all([
+      browser.storage.local.get(AI_CONTEXT_LOCAL),
+      browser.storage.local.get(AI_KEY_LOCAL),
+      browser.storage.local.get(APPLICATIONS_LOCAL)
+    ]);
+    const local = {};
+    if (ctx[AI_CONTEXT_LOCAL] !== undefined) {
+      local[AI_CONTEXT_LOCAL] = ctx[AI_CONTEXT_LOCAL];
+    }
+    if (apps[APPLICATIONS_LOCAL] !== undefined) {
+      local[APPLICATIONS_LOCAL] = apps[APPLICATIONS_LOCAL];
+    }
+    if (
+      opts &&
+      opts.includeApiKey &&
+      typeof key[AI_KEY_LOCAL] === "string" &&
+      key[AI_KEY_LOCAL] !== ""
+    ) {
+      local[AI_KEY_LOCAL] = key[AI_KEY_LOCAL];
+    }
+    return { data: data, local: local };
+  }
+
+  // Restore the sync payload + active flag, then restore the storage.local
+  // user data. Only keys actually present in the export are written; a
+  // redacted export (no API key) leaves the existing stored key untouched.
+  async function importData(api, exported) {
+    exported = exported || {};
+    await api.setModuleData(MODULE_ID, exported.data || {});
+    await api.setModuleActive(MODULE_ID, Boolean(exported.active !== false));
+    const local = exported.local;
+    if (local && typeof local === "object") {
+      const writes = {};
+      if (local[AI_CONTEXT_LOCAL] !== undefined) {
+        writes[AI_CONTEXT_LOCAL] = local[AI_CONTEXT_LOCAL];
+      }
+      if (local[AI_KEY_LOCAL] !== undefined) {
+        writes[AI_KEY_LOCAL] = local[AI_KEY_LOCAL];
+      }
+      if (local[APPLICATIONS_LOCAL] !== undefined) {
+        writes[APPLICATIONS_LOCAL] = local[APPLICATIONS_LOCAL];
+      }
+      if (Object.keys(writes).length) {
+        await browser.storage.local.set(writes);
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1011,10 +1453,13 @@ async function fillPageAction(api) {
     handleMessage: handleMessage,
     createContextMenu: createContextMenu,
     handleMenuClick: handleMenuClick,
+    exportData: exportData,
+    importData: importData,
     quickActions: [
       { id: "fill-page", label: "Fill Page", handler: fillPageAction },
       { id: "add-field", label: "Add Current Field", handler: captureActiveField },
-      { id: "add-all-fields", label: "Add All Fields", handler: addAllFieldsAction }
+      { id: "add-all-fields", label: "Add All Fields", handler: addAllFieldsAction },
+      { id: "applications", label: "Application History", handler: openApplicationsHistory }
     ]
   });
 

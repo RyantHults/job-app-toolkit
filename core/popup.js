@@ -113,4 +113,96 @@
     .sendMessage({ type: "jtk:getModules" })
     .then(renderModules)
     .catch(() => ui.setStatus("Something went wrong"));
+
+  // ------------------------------------------------------------------
+  // Export / import data
+  // ------------------------------------------------------------------
+
+  const includeApiKeyEl = document.getElementById("include-api-key");
+  const exportBtn = document.getElementById("export-btn");
+  const importBtn = document.getElementById("import-btn");
+  const importFile = document.getElementById("import-file");
+
+  function exportFileName() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return "job-app-toolkit-export-" + y + "-" + m + "-" + day + ".json";
+  }
+
+  exportBtn.addEventListener("click", () => {
+    browser.runtime
+      .sendMessage({
+        type: "jtk:exportData",
+        includeApiKey: includeApiKeyEl.checked
+      })
+      .then((res) => {
+        if (!res || !res.ok || !res.export) {
+          ui.setStatus((res && res.error) || "Export failed.");
+          return;
+        }
+        const json = JSON.stringify(res.export, null, 2);
+        const blob = new Blob([json], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = exportFileName();
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        ui.setStatus("Exported " + Object.keys(res.export.modules).length + " modules.");
+      })
+      .catch((err) => {
+        console.error("Job App Toolkit: export failed", err);
+        ui.setStatus("Export failed.");
+      });
+  });
+
+  importBtn.addEventListener("click", () => {
+    importFile.value = "";
+    importFile.click();
+  });
+
+  importFile.addEventListener("change", () => {
+    const file = importFile.files && importFile.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (err) {
+        ui.setStatus("Not a valid export file.");
+        importFile.value = "";
+        return;
+      }
+      const count = parsed && parsed.modules ? Object.keys(parsed.modules).length : 0;
+      ui.showConfirm(
+        "Import will replace the current configuration for " + count + " modules. Continue?"
+      ).then((confirmed) => {
+        if (!confirmed) return;
+        return browser.runtime
+          .sendMessage({ type: "jtk:importData", export: parsed })
+          .then((res) => {
+            if (res && res.ok) {
+              ui.setStatus("Imported " + (res.imported || []).length + " modules.");
+            } else {
+              ui.setStatus((res && res.error) || "Import failed.");
+            }
+          })
+          .catch(() => ui.setStatus("Import failed."));
+      }).then(() => {
+        // Reset the input in every path (parse handled above, cancel and the
+        // send flow here).
+        importFile.value = "";
+      });
+    };
+    reader.onerror = () => {
+      ui.setStatus("Could not read the file.");
+      importFile.value = "";
+    };
+    reader.readAsText(file);
+  });
 })();

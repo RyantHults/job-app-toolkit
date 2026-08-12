@@ -54,26 +54,49 @@ h3 {
 }
 
 .toggle {
-  display: inline-flex;
+  display: block;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
   font-size: 13px;
   color: #374151;
   cursor: pointer;
-  white-space: nowrap;
+  min-width: 0;
 }
 
 .toggle input {
   margin: 0;
+  flex: 0 0 auto;
+}
+
+.toggle > span {
+  flex: 1 1 200px;
+  min-width: 0;
 }
 
 .toggle-row {
   margin: 0 0 8px 0;
 }
 
+.people-cache-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.people-cache-row .people-cache-stats {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .columns {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0,1fr) minmax(0,1fr);
   gap: 12px;
 }
 

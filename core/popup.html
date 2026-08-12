@@ -16,6 +16,17 @@
   <!-- Status / result line -->
   <p id="status" class="status" aria-live="polite"></p>
 
+  <!-- Export / import footer -->
+  <div class="footer">
+    <label class="footer-label">
+      <input type="checkbox" id="include-api-key" />
+      Include API key
+    </label>
+    <button type="button" id="export-btn" class="btn btn-sm">Export data</button>
+    <button type="button" id="import-btn" class="btn btn-sm">Import data</button>
+    <input type="file" id="import-file" accept=".json,application/json,text/plain" hidden />
+  </div>
+
   <!-- Inline modal overlay -->
   <div id="modal-overlay" class="modal-overlay" hidden>
     <div class="modal-card">

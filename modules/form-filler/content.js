@@ -24,10 +24,13 @@
   }
 
   // Fillable <input> types. An <input> with no type defaults to "text" and is
-  // included automatically; hidden/submit/button/reset/file/password/radio are
-  // excluded by not being in this set. Checkboxes are boolean fields whose
-  // profile value ("true"/"false", "yes"/"no", ...) controls the checked state.
-  const FILLABLE_INPUT_TYPES = new Set(["text", "email", "tel", "url", "number", "checkbox"]);
+  // included automatically; hidden/submit/button/reset/file/password are
+  // excluded by not being in this set. Checkboxes and radios are choice
+  // controls: a checkbox is a boolean field whose profile value
+  // ("true"/"false", "yes"/"no", ...) controls the checked state — or, when
+  // part of a multi-answer question group, one option of an array-valued
+  // answer — and radios belong to same-named groups filled as one question.
+  const FILLABLE_INPUT_TYPES = new Set(["text", "email", "tel", "url", "number", "checkbox", "radio"]);
 
   // Fallback hint elements when a field has no label/name/id.
   const HEADER_SELECTOR =
@@ -94,10 +97,12 @@
   // preceding siblings of ancestors). Prefer that specific label over an
   // enclosing <fieldset> <legend>, which describes the group rather than the
   // field; only fall back to the legend when the walk finds nothing nearby
-  // (nothing at all, or only elements outside the fieldset).
-  function getHeaderLikeText(el, doc) {
+  // (nothing at all, or only elements outside the fieldset). Returns the
+  // matched ELEMENT (a <legend> included); both the text form (getFieldTitle /
+  // getHeaderLikeText) and the element form (getTitleElement) share this walk.
+  function walkHeaderLike(el, doc) {
     const root = doc || document;
-    if (!root.body || !root.body.contains(el)) return "";
+    if (!root.body || !root.body.contains(el)) return null;
     const walker = root.createTreeWalker(root.body, NodeFilter.SHOW_ELEMENT);
     walker.currentNode = el;
     let node;
@@ -108,18 +113,122 @@
           const fieldset = el.closest("fieldset");
           if (fieldset && !fieldset.contains(node)) {
             const legend = fieldset.querySelector(":scope > legend");
-            if (legend && legend.textContent.trim() !== "") return legend.textContent;
+            if (legend && legend.textContent.trim() !== "") return legend;
           }
-          return text;
+          return node;
         }
       }
     }
     const fieldset = el.closest("fieldset");
     if (fieldset) {
       const legend = fieldset.querySelector(":scope > legend");
-      if (legend && legend.textContent.trim() !== "") return legend.textContent;
+      if (legend && legend.textContent.trim() !== "") return legend;
     }
-    return "";
+    return null;
+  }
+
+  function getHeaderLikeText(el, doc) {
+    const node = walkHeaderLike(el, doc);
+    return node ? node.textContent.trim() : "";
+  }
+
+  // Title elements flagged as SECTION HEADERS — a title covering more than one
+  // question (an <h2> above several unrelated fields, a shared <fieldset>
+  // <legend> spanning several distinct questions). Computed per document by
+  // the kind-aware pre-pass (computeSectionHeaderTitles) and consulted by the
+  // SAVE side so a section header is never stored as a question's key/label.
+  // Fill-side matching deliberately does NOT consult it — previously-saved
+  // section-header-keyed entries must keep filling.
+  let currentSectionHeaders = new Set();
+
+  // The RAW title-element resolution (no section-header suppression): linked
+  // label[for], parent <label>, aria-labelledby element, then the header-like
+  // walk (which falls back to a <fieldset> <legend> when the walk finds
+  // nothing usable). The section-header pre-pass uses this so it can compute
+  // the suppression set without circularity. An aria-label attribute has no
+  // element, so it contributes nothing here.
+  function rawTitleElement(el, doc) {
+    const root = doc || document;
+    if (el.id) {
+      const label = root.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (label) return label;
+    }
+    const parentLabel = el.closest("label");
+    if (parentLabel) return parentLabel;
+    const labelledby = el.getAttribute("aria-labelledby");
+    if (labelledby) {
+      for (const id of labelledby.split(/\s+/)) {
+        const ref = root.getElementById(id);
+        if (ref) return ref;
+      }
+    }
+    return walkHeaderLike(el, root);
+  }
+
+  // The actual DOM element that reads as a field's question title (used to
+  // place the in-page buttons), mirroring getFieldTitle's priority but
+  // returning the element instead of its text. Identical to rawTitleElement
+  // except an element flagged as a section header resolves to null — its text
+  // is never a single question's own title. Returns null when no title element
+  // exists — button placement then falls back to the field itself.
+  function getTitleElement(el, doc) {
+    const t = rawTitleElement(el, doc);
+    return t && currentSectionHeaders.has(t) ? null : t;
+  }
+
+  // Kind-aware section-header pre-pass. A title element that reads as covering
+  // MORE THAN ONE question is a section header — never a valid single-question
+  // key/label. Singles each form their own question, so a title resolving for
+  // ≥2 fields with ANY single-answer resolver is flagged; a title resolving
+  // only for radio/multiChoice fields is flagged iff those resolvers carry ≥2
+  // DISTINCT non-empty `name`s (same-named or all-nameless choice controls are
+  // ONE question — their title is a real question title and stays usable).
+  function computeSectionHeaderTitles(root) {
+    const flags = new Set();
+    const byTitle = new Map();
+    for (const f of discoverFields(root)) {
+      const t = rawTitleElement(f.el, root);
+      if (!t) continue;
+      if (!byTitle.has(t)) byTitle.set(t, []);
+      byTitle.get(t).push(f);
+    }
+    for (const [t, resolvers] of byTitle) {
+      if (resolvers.length < 2) continue;
+      let hasSingle = false;
+      let hasChoice = false;
+      const names = new Set();
+      for (const f of resolvers) {
+        const kind = classifyField(f.el);
+        if (kind === "single") hasSingle = true;
+        else hasChoice = true;
+        const n = String(f.el.name || "").trim();
+        if (n) names.add(n);
+      }
+      if (hasSingle) {
+        flags.add(t);
+      } else if (hasChoice && names.size >= 2) {
+        flags.add(t);
+      }
+    }
+    return flags;
+  }
+
+  // Lazy section-header ensure for save-side paths that do not run
+  // discoverGroups (the focused-capture flow). Recomputes when the cached set
+  // is empty or holds elements from a different document (the same-origin
+  // iframe walk covers several documents, and the set is reset per scan).
+  function ensureSectionHeaders(root) {
+    let valid = true;
+    for (const t of currentSectionHeaders) {
+      if (!root.contains(t)) {
+        valid = false;
+        break;
+      }
+    }
+    if (currentSectionHeaders.size === 0 || !valid) {
+      currentSectionHeaders = computeSectionHeaderTitles(root);
+    }
+    return currentSectionHeaders;
   }
 
   // Ordered candidate names for a field. First match wins, so priority is:
@@ -154,19 +263,451 @@
   }
 
   // ------------------------------------------------------------------
+  // Question grouping
+  // ------------------------------------------------------------------
+  //
+  // A question is either one single-answer control or a set of choice controls
+  // (checkboxes, same-named radios, a multiple select) that together answer
+  // one question. Groups let the in-page buttons render once per question and
+  // let multi-answer questions save/fill an ARRAY of selected options. A group
+  // carries: kind ("single" | "radio" | "multiChoice"), inputs (the fillable
+  // elements), titleEl (the title ELEMENT for button placement, may be null),
+  // titleText (whitespace-collapsed question text), key (cleaned storage-key
+  // candidate), container (fieldset/shared container, may be null) and anchor
+  // (the stable element the button map is keyed by).
+
+  // Classify a fillable element: single-answer controls vs the choice controls
+  // that participate in question grouping.
+  function classifyField(el) {
+    if (el.tagName === "SELECT") return el.multiple ? "multiChoice" : "single";
+    if (el.tagName === "TEXTAREA") return "single";
+    if (el.tagName === "INPUT") {
+      const type = (el.getAttribute("type") || "text").toLowerCase();
+      if (type === "radio") return "radio";
+      if (type === "checkbox") return "multiChoice";
+      return "single";
+    }
+    return "single";
+  }
+
+  // The option label for a choice control: its linked label, else its wrapping
+  // label, else "" (callers fall back to the value attribute).
+  function getInputLabelText(el) {
+    const doc = el.ownerDocument || document;
+    return getLinkedLabelText(el, doc) || getParentLabelText(el) || "";
+  }
+
+  function collapseWs(str) {
+    return String(str == null ? "" : str).trim().replace(/\s+/g, " ");
+  }
+
+  // Is this header-like element an OPTION label rather than a question title:
+  // a <label> that wraps a fillable control (its own or a sibling option's),
+  // or whose `for` points at a control inside the container, OR a non-LABEL
+  // element (Ashby renders option labels as <span class="_label_...">) that
+  // is a sibling of a fillable control under a parent holding exactly one
+  // fillable — it titles that option, never a question.
+  function isOptionLabel(node, container) {
+    if (!node) return false;
+    if (node.tagName === "LABEL") {
+      if (node.querySelector("input, textarea, select")) return true;
+      const forId = node.getAttribute && node.getAttribute("for");
+      if (forId && container.querySelector("#" + CSS.escape(forId))) return true;
+      return false;
+    }
+    // Non-LABEL option label: shares a parent with exactly one fillable
+    // control (Ashby's <span class="_label_132c8_93"> sits next to its radio
+    // inside <span class="_container_132c8_28">). Question titles sit above
+    // several fillables, so a parent with a single fillable is an option row.
+    const parent = node.parentElement;
+    if (!parent || !parent.querySelectorAll) return false;
+    const fillables = parent.querySelectorAll("input, textarea, select");
+    return fillables.length === 1;
+  }
+
+  // The closest preceding title element for a field, walking backward in
+  // document order within `container` (the walk never leaves it). For
+  // multiChoice AND radio fields option labels do NOT count as a closer title
+  // (they title the options, including a sibling option's); only single fields
+  // count any closer title (including their own label).
+  function closestPrecedingTitle(el, container) {
+    const root = container.ownerDocument || document;
+    const walker = root.createTreeWalker(container, NodeFilter.SHOW_ELEMENT);
+    walker.currentNode = el;
+    let node;
+    while ((node = walker.previousNode())) {
+      if (node === container) continue;
+      if (node.matches && node.matches(HEADER_SELECTOR)) {
+        const text = node.textContent.trim();
+        if (!text || text.length >= 200) continue;
+        if (classifyField(el) !== "single" && isOptionLabel(node, container)) continue;
+        return node;
+      }
+    }
+    return null;
+  }
+
+  // A shared container is only a valid QUESTION container when the multi-choice
+  // fields it holds all share ONE non-empty name or are all nameless — a
+  // container holding 2+ distinct-name questions is a section, not a question,
+  // and its fields fall through to name-based grouping instead.
+  function containerHoldsOneQuestion(container) {
+    if (!container || typeof container.querySelector !== "function") return false;
+    const names = new Set();
+    let count = 0;
+    const nodes = container.querySelectorAll("input, textarea, select");
+    for (const el of nodes) {
+      if (!isFillable(el)) continue;
+      if (classifyField(el) !== "multiChoice") continue;
+      count++;
+      const n = String(el.name || "").trim();
+      if (n) names.add(n);
+    }
+    if (count === 0) return false;
+    return names.size <= 1;
+  }
+
+  // A header-like element inside a container that reads as the container's
+  // QUESTION title (for the shared-container grouping fallback). Per-option
+  // labels — labels wrapping a fillable input, or <label for> pointing at one
+  // inside the container — title the options, not the question, and are
+  // skipped, as are section headers (a candidate explicitly flagged by the
+  // pre-pass, or one with ≥2 fillable fields beneath it that resolve to a
+  // closer title inside the container). First match in document order wins.
+  function findContainerTitle(container) {
+    if (!container || typeof container.querySelector !== "function") return null;
+    const root = container.ownerDocument || document;
+    const fillables = [];
+    const all = root.querySelectorAll("input, textarea, select");
+    for (const el of all) {
+      if (isFillable(el) && container.contains(el)) fillables.push(el);
+    }
+    const nodes = container.querySelectorAll(HEADER_SELECTOR);
+    for (const node of nodes) {
+      const text = node.textContent.trim();
+      if (!text || text.length >= 200) continue;
+      if (node.tagName === "LABEL") {
+        if (node.querySelector("input, textarea, select")) continue;
+        const forId = node.getAttribute && node.getAttribute("for");
+        if (forId && container.querySelector("#" + CSS.escape(forId))) continue;
+      }
+      if (currentSectionHeaders.has(node)) continue;
+      // Section-header guard: if ≥2 fillable fields in the container have a
+      // closer title than this candidate (a title inside the container that is
+      // not this candidate), the candidate reads as a section header covering
+      // several questions — skip it and keep scanning.
+      let coveredElsewhere = 0;
+      for (const el of fillables) {
+        const closer = closestPrecedingTitle(el, container);
+        if (closer && closer !== node && container.contains(closer)) coveredElsewhere++;
+        if (coveredElsewhere >= 2) break;
+      }
+      if (coveredElsewhere >= 2) continue;
+      return node;
+    }
+    return null;
+  }
+
+  // Nearest ancestor of `inputs[0]` that contains every input, holds a single
+  // multi-choice question (one shared non-empty name, or all nameless) AND has
+  // a question title of its own (a header-like/label element that is not a
+  // per-option label).
+  function findSharedContainer(inputs) {
+    if (!inputs || inputs.length < 2) return null;
+    const first = inputs[0];
+    for (
+      let node = first.parentElement;
+      node && node.tagName !== "BODY" && node.tagName !== "HTML";
+      node = node.parentElement
+    ) {
+      if (
+        inputs.every((el) => node.contains(el)) &&
+        containerHoldsOneQuestion(node) &&
+        findContainerTitle(node)
+      ) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  // Resolve a multi-choice group's title, in priority order: fieldset legend,
+  // then a shared title element (identical resolved element), then a shared
+  // container with a question title of its own. Returns { titleEl, container }
+  // (both may be null). No branch may return a section-header title: the
+  // fieldset-legend branch rejects flagged legends, getTitleElement already
+  // suppresses flagged elements for the shared-title branch, and the container
+  // branch nulls a flagged title (findContainerTitle already skips them).
+  function resolveGroupTitle(inputs, doc) {
+    const root = doc || document;
+    const firstFieldset = inputs[0].closest("fieldset");
+    if (firstFieldset && inputs.every((el) => el.closest("fieldset") === firstFieldset)) {
+      const legend = firstFieldset.querySelector(":scope > legend");
+      if (legend && legend.textContent.trim() !== "" && !currentSectionHeaders.has(legend)) {
+        return { titleEl: legend, container: firstFieldset };
+      }
+      // No (usable) legend: a fieldset with a question title of its own is ONE
+      // question even when every option carries a distinct `name` (Ashby names
+      // options by their label text). findContainerTitle skips per-option
+      // labels, flagged section headers, and titles covering 2+ closer-titled
+      // fields, so a titled fieldset that really holds several questions still
+      // falls through to name-based grouping.
+      const fsTitle = findContainerTitle(firstFieldset);
+      if (fsTitle) return { titleEl: fsTitle, container: firstFieldset };
+    }
+    const firstTitle = getTitleElement(inputs[0], root);
+    if (
+      firstTitle &&
+      !currentSectionHeaders.has(firstTitle) &&
+      inputs.every((el) => getTitleElement(el, root) === firstTitle)
+    ) {
+      return { titleEl: firstTitle, container: firstTitle };
+    }
+    const container = findSharedContainer(inputs);
+    if (container) {
+      const titleEl = findContainerTitle(container);
+      return {
+        titleEl: titleEl && !currentSectionHeaders.has(titleEl) ? titleEl : null,
+        container
+      };
+    }
+    return { titleEl: null, container: null };
+  }
+
+  // Build a question group object from its member inputs. Single groups resolve
+  // their title exactly as before (linked/parent label, then the header walk)
+  // via getTitleElement; multi-choice groups use the group-title priority
+  // (fieldset legend → shared title element → shared container). Radio groups
+  // key the button map by their first radio so two radio groups sharing one
+  // fieldset legend never collide; single groups key by the input element as
+  // before; other multi-choice groups key by the title element when one exists
+  // (the post-pass in discoverGroups clears section-header titles, after which
+  // the anchor falls back to the group's first input).
+  function makeGroup(kind, inputs, doc) {
+    const root = doc || document;
+    const first = inputs[0];
+    let titleEl;
+    let container;
+    if (kind === "single") {
+      titleEl = getTitleElement(first, root);
+    } else {
+      const title = resolveGroupTitle(inputs, root);
+      titleEl = title.titleEl;
+      container = title.container || null;
+    }
+    const titleText = titleEl ? collapseWs(titleEl.textContent) : "";
+    const key = cleanFieldName(titleText) || String(first.name || first.id || "").trim();
+    return {
+      kind,
+      inputs,
+      titleEl,
+      titleText,
+      key,
+      container,
+      anchor: kind === "single" || kind === "radio" ? first : titleEl || first
+    };
+  }
+
+  // Partition a document's fillable fields into question groups: one group per
+  // single-answer control, and one group per set of choice controls answering
+  // the same question. Multi-choice grouping priority: nearest <fieldset>,
+  // then a shared question title element, then a shared container holding 2+
+  // choice inputs and a question title of its own. Radios group by their
+  // shared `name` — a radio group is one question; different names are
+  // different questions.
+  function discoverGroups(doc) {
+    const root = doc || document;
+    // Section-header pre-pass FIRST: every title resolution below (and the
+    // save-side text fallback) consults this set.
+    currentSectionHeaders = computeSectionHeaderTitles(root);
+    const fields = discoverFields(root);
+    const groups = [];
+    const singles = [];
+    const radios = [];
+    const multi = [];
+
+    for (const f of fields) {
+      const kind = classifyField(f.el);
+      if (kind === "radio") radios.push(f);
+      else if (kind === "multiChoice") multi.push(f);
+      else singles.push(f);
+    }
+
+    // Single-answer controls: each is its own group.
+    for (const f of singles) groups.push(makeGroup("single", [f.el], root));
+
+    // Radios: same name = one question; nameless radios stand alone.
+    const radioByName = new Map();
+    for (const f of radios) {
+      const name = f.el.name;
+      if (!name) {
+        groups.push(makeGroup("radio", [f.el], root));
+        continue;
+      }
+      if (!radioByName.has(name)) radioByName.set(name, []);
+      radioByName.get(name).push(f.el);
+    }
+    for (const els of radioByName.values()) groups.push(makeGroup("radio", els, root));
+
+    // Checkboxes + multiple selects: nearest <fieldset> ancestor first. A
+    // fieldset that reads as ONE question — it has a question title of its own
+    // (e.g. Ashby renders every "select all that apply" option with a DISTINCT
+    // `name` equal to its label text under one question-title <label>) — groups
+    // ALL its multi inputs together, regardless of names. A fieldset without
+    // such a title can hold several DISTINCT questions (different `name`s, or
+    // nameless controls), so its multi inputs are bucketed by non-empty name —
+    // one group per distinct name plus one group for the nameless remainder.
+    const assigned = new Set();
+    const byFieldset = new Map();
+    for (const f of multi) {
+      const fs = f.el.closest("fieldset");
+      if (fs) {
+        if (!byFieldset.has(fs)) byFieldset.set(fs, []);
+        byFieldset.get(fs).push(f.el);
+      }
+    }
+    for (const [fs, els] of byFieldset.entries()) {
+      if (findContainerTitle(fs)) {
+        groups.push(makeGroup("multiChoice", els, root));
+        for (const el of els) assigned.add(el);
+        continue;
+      }
+      const byName = new Map();
+      const nameless = [];
+      for (const el of els) {
+        const name = String(el.name || "").trim();
+        if (name) {
+          if (!byName.has(name)) byName.set(name, []);
+          byName.get(name).push(el);
+        } else {
+          nameless.push(el);
+        }
+      }
+      const buckets = Array.from(byName.values());
+      if (nameless.length > 0) buckets.push(nameless);
+      for (const bucket of buckets) {
+        groups.push(makeGroup("multiChoice", bucket, root));
+        for (const el of bucket) assigned.add(el);
+      }
+    }
+
+    // Then a shared question title element (identical resolved element).
+    for (const f of multi) {
+      if (assigned.has(f.el)) continue;
+      const titleEl = getTitleElement(f.el, root);
+      if (!titleEl) continue;
+      const members = multi.filter(
+        (x) => !assigned.has(x.el) && getTitleElement(x.el, root) === titleEl
+      );
+      if (members.length >= 2) {
+        groups.push(makeGroup("multiChoice", members.map((x) => x.el), root));
+        for (const x of members) assigned.add(x.el);
+      }
+    }
+
+    // Then a shared container holding 2+ choice inputs and a question title of
+    // its own (e.g. <div class="question"><span class="label">Skills</span>
+    // <label><input type=checkbox>Java</label> ... </div>). Only containers
+    // whose unassigned multi fields form ONE question (one shared non-empty
+    // name, or all nameless) qualify — a container holding 2+ distinct-name
+    // questions is a section, not a question, and its fields fall through.
+    for (const f of multi) {
+      if (assigned.has(f.el)) continue;
+      let container = null;
+      for (
+        let node = f.el.parentElement;
+        node && node.tagName !== "BODY" && node.tagName !== "HTML";
+        node = node.parentElement
+      ) {
+        let count = 0;
+        for (const x of multi) {
+          if (!assigned.has(x.el) && node.contains(x.el)) count++;
+        }
+        if (count >= 2 && containerHoldsOneQuestion(node) && findContainerTitle(node)) {
+          container = node;
+          break;
+        }
+      }
+      if (!container) continue;
+      const members = multi.filter((x) => !assigned.has(x.el) && container.contains(x.el));
+      groups.push(makeGroup("multiChoice", members.map((x) => x.el), root));
+      for (const x of members) assigned.add(x.el);
+    }
+
+    // Leftover choice controls that share a non-empty `name` still answer one
+    // question together (e.g. same-named checkboxes sitting directly under a
+    // section header): group them by shared name — one group per name. The
+    // standalone loop below then handles only nameless leftovers.
+    const multiByName = new Map();
+    for (const f of multi) {
+      if (assigned.has(f.el)) continue;
+      const name = String(f.el.name || "").trim();
+      if (!name) continue;
+      if (!multiByName.has(name)) multiByName.set(name, []);
+      multiByName.get(name).push(f.el);
+    }
+    for (const els of multiByName.values()) {
+      groups.push(makeGroup("multiChoice", els, root));
+      for (const el of els) assigned.add(el);
+    }
+
+    // Leftover choice controls with no name and no group context: each its own
+    // group (a lone checkbox stays a scalar boolean field, exactly as before).
+    for (const f of multi) {
+      if (assigned.has(f.el)) continue;
+      groups.push(makeGroup("multiChoice", [f.el], root));
+    }
+
+    // POST-PASS: a title element shared by ≥2 groups is a section header the
+    // save path must not key by (e.g. one fieldset legend above two distinct
+    // checkbox questions, or two radio groups under one legend). Clear the
+    // title on every group that shares it and recompute the storage key from
+    // the group's first input (and re-anchor at that input) so identical
+    // legend-derived keys can never collide — the buildMatchEntries dedup
+    // would silently drop one, and shared anchors would share one button map
+    // entry.
+    const groupsByTitle = new Map();
+    for (const g of groups) {
+      if (!g.titleEl) continue;
+      if (!groupsByTitle.has(g.titleEl)) groupsByTitle.set(g.titleEl, []);
+      groupsByTitle.get(g.titleEl).push(g);
+    }
+    for (const groupList of groupsByTitle.values()) {
+      if (groupList.length < 2) continue;
+      for (const g of groupList) {
+        g.titleEl = null;
+        g.titleText = "";
+        g.key = cleanFieldName(String(g.inputs[0].name || g.inputs[0].id || "").trim());
+        g.anchor = g.inputs[0];
+      }
+    }
+
+    return groups;
+  }
+
+  // ------------------------------------------------------------------
   // Matching
   // ------------------------------------------------------------------
 
   // Each stored field can match on two identities: the element's name/id (the
   // profile key) and the human-readable title (label). Build one match entry
   // per usable field, carrying both normalized identities plus the fill value.
+  // Values may be scalars (single-answer fields) or ARRAYS (multi-answer
+  // questions) — empty scalars carry no data, but an empty array is meaningful
+  // (a saved multi-answer question with nothing selected) and must survive.
   function buildMatchEntries(fields) {
     const entries = [];
     for (const key of Object.keys(fields)) {
       const entry = fields[key];
-      const isObj = entry && typeof entry === "object";
+      const isObj = entry && typeof entry === "object" && !Array.isArray(entry);
       const value = isObj ? entry.value : entry;
-      if (value === undefined || value === null || String(value) === "") continue;
+      if (
+        value === undefined ||
+        value === null ||
+        (!Array.isArray(value) && String(value) === "")
+      ) {
+        continue;
+      }
       const label = isObj && entry.label ? entry.label : key;
       const norms = [];
       const keyNorm = normalize(key);
@@ -359,9 +900,27 @@
   // <select> with no matching option). An option matches when the profile
   // value equals the option's value attribute OR its visible text, so selects
   // captured as their internal value (e.g. "US") also match options displayed
-  // as labels (e.g. "United States") and vice versa.
+  // as labels (e.g. "United States") and vice versa. An ARRAY value applied to
+  // a checkbox or select means "checked/selected iff the array contains this
+  // option's value or label" (used for multi-answer questions); scalar values
+  // keep their historical behavior.
   function fillField(el, value) {
     if (el.tagName === "SELECT") {
+      if (Array.isArray(value)) {
+        const norms = value.map(normalize);
+        let changed = false;
+        for (const opt of el.options) {
+          const on =
+            norms.indexOf(normalize(opt.value)) !== -1 ||
+            norms.indexOf(normalize(opt.textContent)) !== -1;
+          if (opt.selected !== on) {
+            opt.selected = on;
+            changed = true;
+          }
+        }
+        if (changed) el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
       const norm = normalize(value);
       let option = null;
       for (const opt of el.options) {
@@ -376,7 +935,15 @@
       return true;
     }
     if (el.type === "checkbox") {
-      const desired = isTruthyBoolean(value);
+      let desired;
+      if (Array.isArray(value)) {
+        const norms = value.map(normalize);
+        desired =
+          norms.indexOf(normalize(el.value)) !== -1 ||
+          norms.indexOf(normalize(getInputLabelText(el))) !== -1;
+      } else {
+        desired = isTruthyBoolean(value);
+      }
       if (el.checked !== desired) {
         el.checked = desired;
         el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -386,6 +953,99 @@
     }
     setNativeValue(el, String(value));
     return true;
+  }
+
+  // Does a choice-control group already hold the stored state? For an array
+  // value: every checkbox/option must already be checked iff its value or
+  // label is in the stored array (so a full override is a no-op). For a scalar
+  // on a lone checkbox: the box already matches the boolean. Radio groups: the
+  // checked radio already matches the stored scalar.
+  function groupMatchesStoredState(group, value) {
+    if (group.kind === "radio") {
+      const norm = normalize(value);
+      const checked = group.inputs.find((x) => x.checked);
+      if (!checked) return false;
+      return (
+        normalize(checked.value) === norm || normalize(getInputLabelText(checked)) === norm
+      );
+    }
+    if (group.kind === "multiChoice") {
+      if (Array.isArray(value)) {
+        const norms = new Set(value.map(normalize));
+        const inSet = (text) => norms.has(normalize(text));
+        for (const el of group.inputs) {
+          if (el.tagName === "SELECT") {
+            for (const opt of el.options) {
+              if (opt.selected !== (inSet(opt.value) || inSet(opt.textContent))) return false;
+            }
+          } else if (el.type === "checkbox") {
+            if (el.checked !== (inSet(el.value) || inSet(getInputLabelText(el)))) return false;
+          }
+        }
+        return true;
+      }
+      // Scalar value: only meaningful for a lone checkbox (boolean encoding).
+      return (
+        group.inputs.length === 1 &&
+        group.inputs[0].type === "checkbox" &&
+        group.inputs[0].checked === isTruthyBoolean(value)
+      );
+    }
+    return true;
+  }
+
+  // Apply a stored value to a whole question group (used by the group fill
+  // button and by fillPage). Arrays fully override every checkbox/option:
+  // options in the array are selected, everything else is deselected. Radios
+  // check the one radio whose value/label matches the scalar. Single groups
+  // fall through to fillField.
+  function fillGroup(group, value) {
+    if (group.kind === "radio") {
+      const norm = normalize(value);
+      for (const el of group.inputs) {
+        const on =
+          normalize(el.value) === norm || normalize(getInputLabelText(el)) === norm;
+        if (el.checked !== on) {
+          el.checked = on;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      return;
+    }
+    if (group.kind === "multiChoice") {
+      if (Array.isArray(value)) {
+        const norms = new Set(value.map(normalize));
+        const inSet = (text) => norms.has(normalize(text));
+        for (const el of group.inputs) {
+          if (el.tagName === "SELECT") {
+            let changed = false;
+            for (const opt of el.options) {
+              const on = inSet(opt.value) || inSet(opt.textContent);
+              if (opt.selected !== on) {
+                opt.selected = on;
+                changed = true;
+              }
+            }
+            if (changed) el.dispatchEvent(new Event("change", { bubbles: true }));
+          } else if (el.type === "checkbox") {
+            const on = inSet(el.value) || inSet(getInputLabelText(el));
+            if (el.checked !== on) {
+              el.checked = on;
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+          }
+        }
+        return;
+      }
+      // Scalar on a multi group: only a lone checkbox (backward-compatible
+      // boolean fill) can consume it.
+      if (group.inputs.length === 1 && group.inputs[0].type === "checkbox") {
+        fillField(group.inputs[0], value);
+      }
+      return;
+    }
+    fillField(group.inputs[0], value);
   }
 
   // ------------------------------------------------------------------
@@ -400,7 +1060,36 @@
 
     const entries = buildMatchEntries(fields);
     const fieldList = discoverFields(root);
+
+    // Choice controls are matched individually but filled as their question
+    // group: an array-valued entry applies to every checkbox/option at once
+    // (full override, like the per-question fill button), and a radio entry
+    // checks the one matching radio. Matching stays per-element, so each
+    // member of a radio/multiChoice group also carries the group's question
+    // title identities (that is how a title-keyed multi-answer entry finds the
+    // group). Map each fillable element to its group so a group fill runs
+    // exactly once.
+    const fieldByEl = new Map(fieldList.map((f) => [f.el, f]));
+    const groups = discoverGroups(root);
+    const groupByEl = new Map();
+    for (const g of groups) {
+      const titleCands = [];
+      for (const t of [g.key, g.titleText]) {
+        const n = normalize(t);
+        if (n && titleCands.indexOf(n) === -1) titleCands.push(n);
+      }
+      for (const el of g.inputs) {
+        groupByEl.set(el, g);
+        if (g.kind === "single") continue;
+        const field = fieldByEl.get(el);
+        if (!field) continue;
+        for (const cand of titleCands) {
+          if (field.candidates.indexOf(cand) === -1) field.candidates.push(cand);
+        }
+      }
+    }
     const matches = matchFields(entries, fieldList);
+    const handledGroups = new Set();
 
     let filled = 0;
     let skipped = 0;
@@ -409,17 +1098,42 @@
 
     for (const m of matches) {
       const el = m.field.el;
+      const target = m.entry.value;
+      const group = groupByEl.get(el);
+      const isGroupQuestion = group && (group.kind === "radio" || group.kind === "multiChoice");
+
+      if (isGroupQuestion) {
+        matchedKeys.add(m.key);
+        if (handledGroups.has(group)) continue;
+        handledGroups.add(group);
+        // Mismatched value shapes (an array on a radio group, a scalar on a
+        // real multi-answer question) cannot be mapped — leave untouched.
+        if (
+          (group.kind === "radio" && Array.isArray(target)) ||
+          (group.kind === "multiChoice" &&
+            !Array.isArray(target) &&
+            !(group.inputs.length === 1 && group.inputs[0].type === "checkbox"))
+        ) {
+          continue;
+        }
+        if (groupMatchesStoredState(group, target)) {
+          skipped++;
+          skippedNames.push(group.titleText || group.key);
+        } else {
+          fillGroup(group, target);
+          filled++;
+        }
+        continue;
+      }
+
+      // An array value landing on a plain single-answer field cannot be applied
+      // (never stringify it) — leave untouched.
+      if (Array.isArray(target)) continue;
+
       // Never overwrite data. A field "has data" when it holds a real value;
       // placeholder prompts (e.g. a dropdown showing "— Make a Selection —"
-      // with an internal sentinel value) do not count. For checkboxes the
-      // current checked state is the "value", so a box that already matches
-      // its target state is skipped.
-      const isCheckbox = el.type === "checkbox";
-      const target = m.entry.value;
-      const isFilled = isCheckbox
-        ? el.checked === isTruthyBoolean(target)
-        : fieldHasData(el);
-      if (isFilled) {
+      // with an internal sentinel value) do not count.
+      if (fieldHasData(el)) {
         skipped++;
         matchedKeys.add(m.key);
         skippedNames.push(getFieldTitle(el, root) || el.name || el.id);
@@ -444,6 +1158,34 @@
       getAriaLabelledbyText(el, doc) ||
       el.getAttribute("aria-label") ||
       getHeaderLikeText(el, doc) ||
+      el.getAttribute("placeholder") ||
+      "";
+    return String(title).trim().replace(/\s+/g, " ");
+  }
+
+  // Save-side-only header-like text: identical to getHeaderLikeText (which fill
+  // MATCHING still uses so legacy section-header-keyed entries keep filling)
+  // except a walked element flagged as a section header contributes NOTHING —
+  // so an unnamed field whose only title is a section header falls through to
+  // its placeholder/aria-label instead of being keyed by the section header.
+  function getHeaderLikeTextIfLocal(el, doc) {
+    const node = walkHeaderLike(el, doc);
+    if (!node) return "";
+    if (currentSectionHeaders.has(node)) return "";
+    return node.textContent.trim();
+  }
+
+  // Save-side field title: getFieldTitle's priority, but the header-like-text
+  // step is section-header-suppressed (so placeholder wins for a field whose
+  // only title is a section header). Only the SAVE side uses this.
+  function saveFieldTitle(el, doc) {
+    const root = doc || document;
+    const title =
+      getLinkedLabelText(el, root) ||
+      getParentLabelText(el) ||
+      getAriaLabelledbyText(el, root) ||
+      el.getAttribute("aria-label") ||
+      getHeaderLikeTextIfLocal(el, root) ||
       el.getAttribute("placeholder") ||
       "";
     return String(title).trim().replace(/\s+/g, " ");
@@ -520,18 +1262,68 @@
   // checkbox's value is its checked state as a string.
   function describeField(el, doc) {
     const root = doc || document;
+    // The focused-capture flow does not run discoverGroups, so make sure the
+    // section-header set is computed for this document before resolving the
+    // save-side title.
+    ensureSectionHeaders(root);
     const candidates = getCandidates(el, root);
 
     // Matching key: the element's actual name/id first (never placeholder
-    // text), then the title above, then any remaining candidate. Real name/id
+    // text), then the save-side title (section-header-suppressed), then the
+    // first candidate that is not the suppressed section-header text — a field
+    // whose only title is a section header is never keyed by it. Real name/id
     // attributes are kept verbatim; title text is cleaned of punctuation.
     const rawName = String(el.name || el.id || "").trim();
-    const name = rawName || cleanFieldName(getFieldTitle(el, root)) || candidates[0] || "";
+    const headerNorm = normalize(getHeaderLikeText(el, root));
+    const firstNonHeader = candidates.find((c) => c !== headerNorm) || "";
+    const saveTitle = cleanFieldName(saveFieldTitle(el, root));
 
-    let fieldLabel = cleanFieldName(getFieldTitle(el, root)) || rawName || candidates[0] || "";
+    const name = rawName || saveTitle || firstNonHeader || "";
+
+    let fieldLabel = saveTitle || rawName || firstNonHeader || "";
     if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
 
     const value = el.type === "checkbox" ? String(el.checked) : el.value;
+    return { name, value, fieldLabel };
+  }
+
+  // Describe a QUESTION GROUP for the save flow: the storage key (cleaned
+  // group title for multi-answer questions; the element name/id for singles,
+  // exactly as describeField does) and the value — an ARRAY of the selected
+  // options' labels (falling back to their value attributes) for multi-answer
+  // questions, the checked radio's label/value for radio groups, and the
+  // current scalar value for singles. A lone checkbox keeps its historical
+  // scalar String(checked) encoding.
+  function describeGroup(group) {
+    if (group.kind === "single") {
+      return describeField(group.inputs[0], group.inputs[0].ownerDocument);
+    }
+    const titleText = group.titleText;
+    const name =
+      cleanFieldName(titleText) ||
+      String(group.inputs[0].name || group.inputs[0].id || "").trim() ||
+      "";
+    let fieldLabel = cleanFieldName(titleText) || name;
+    if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
+
+    let value;
+    if (group.kind === "radio") {
+      const checked = group.inputs.find((x) => x.checked);
+      value = checked ? collapseWs(getInputLabelText(checked)) || checked.value : "";
+    } else if (group.inputs.length === 1 && group.inputs[0].type === "checkbox") {
+      value = String(group.inputs[0].checked);
+    } else {
+      value = [];
+      for (const el of group.inputs) {
+        if (el.tagName === "SELECT") {
+          for (const opt of el.selectedOptions) {
+            value.push(collapseWs(opt.textContent) || opt.value);
+          }
+        } else if (el.type === "checkbox" && el.checked) {
+          value.push(collapseWs(getInputLabelText(el)) || el.value);
+        }
+      }
+    }
     return { name, value, fieldLabel };
   }
 
@@ -541,10 +1333,35 @@
     return describeField(el);
   }
 
+  // Subtitle/description copy near the field's question title (e.g. Ashby's
+  // .ashby-application-form-question-description) that tells the AI agent what
+  // the question is really asking. Scans the title element's container for
+  // description/subtitle/hint-styled text positioned AFTER the title, so a
+  // container holding several questions can't leak another question's copy
+  // into this field's context. Returns collapsed text ("" when none), capped
+  // at 800 chars to bound prompt size.
+  function fieldSubtitle(el, doc) {
+    const root = doc || document;
+    const titleEl = getTitleElement(el, root);
+    if (!titleEl || !titleEl.parentElement) return "";
+    const nodes = titleEl.parentElement.querySelectorAll(
+      '[class*="description"], [class*="subtitle"], [class*="hint"], small, em'
+    );
+    const AFTER = Node.DOCUMENT_POSITION_FOLLOWING;
+    for (const node of nodes) {
+      if (node.querySelector("input, textarea, select")) continue;
+      if (!(titleEl.compareDocumentPosition(node) & AFTER)) continue;
+      const text = collapseWs(node.textContent);
+      if (text) return text.length > 800 ? text.slice(0, 800).trim() : text;
+    }
+    return "";
+  }
+
   // Describe a field for the "Answer with AI" flow: everything describeField
   // captures (name, label, value) plus the constraints the prompt needs —
-  // maxlength, single-line vs multiline, the element type/tag, and the page
-  // title as extra context.
+  // maxlength, single-line vs multiline, the element type/tag, the page
+  // title as extra context, and any subtitle/description text near the
+  // question title.
   function describeAIField(el) {
     return {
       ok: true,
@@ -555,35 +1372,69 @@
         el.tagName === "INPUT" ? el.getAttribute("type") || "text" : el.tagName.toLowerCase(),
       tagName: el.tagName,
       pageTitle: (el.ownerDocument || document).title || "",
+      subtitle: fieldSubtitle(el, el.ownerDocument),
       ...describeField(el, el.ownerDocument)
     };
   }
 
-  // Collect every field on the page that has been filled out and is not yet
-  // represented in the profile. A field counts as already in the profile when
-  // it matches an existing entry under the same identity matching used to fill
-  // (exact candidates, then contains) — existing entries are never overwritten.
-  // Fields with no usable name or an empty value are skipped and counted.
+  // Collect every QUESTION on the page that has been filled out and is not yet
+  // represented in the profile, one entry per question — a checkbox/radio group
+  // or select[multiple] is a single multi-answer entry with an ARRAY value, a
+  // lone checkbox stays a scalar boolean, and singles keep their element value
+  // exactly as before. A question counts as already in the profile when an
+  // existing entry matches its identity under the same matching used to fill —
+  // existing entries are never overwritten. Questions with no usable name, or
+  // with an empty single/radio answer, are skipped and counted.
   function collectFilledFields(profileFields, doc) {
     const root = doc || document;
     const entries = buildMatchEntries(profileFields || {});
     const results = [];
     let skippedExisting = 0;
     let skippedEmpty = 0;
-    const fieldList = discoverFields(root);
+    const groups = discoverGroups(root);
 
-    for (const field of fieldList) {
-      const el = field.el;
-      const desc = describeField(el, root);
+    for (const group of groups) {
+      const desc = describeGroup(group);
       if (!desc.name) {
         skippedEmpty++;
         continue;
       }
-      if (!(el.type === "checkbox") && !fieldHasData(el)) {
-        skippedEmpty++;
-        continue;
+      // Empty-answer rules. Multi-answer questions store [] — a meaningful,
+      // storable value — so they are always collectible (and a lone checkbox's
+      // checked state is always meaningful, mirroring today's exemption):
+      //   - singles: skip unless the control holds real data (placeholder
+      //     detection lives in fieldHasData).
+      //   - radio groups: nothing checked → scalar "" cannot be stored → skip.
+      if (group.kind === "single") {
+        if (!fieldHasData(group.inputs[0])) {
+          skippedEmpty++;
+          continue;
+        }
+      } else if (group.kind === "radio") {
+        if (desc.value === "" || desc.value === null || desc.value === undefined) {
+          skippedEmpty++;
+          continue;
+        }
       }
-      if (matchFields(entries, [field]).length > 0) {
+      // Already in the profile? Match the group's question identity: every
+      // member field carries its own candidates plus the group's title
+      // identities, and any member match counts the whole question as existing
+      // (existing entries are never overwritten).
+      const memberFields = group.inputs.map((el) => ({
+        el,
+        candidates: getCandidates(el, root)
+      }));
+      const titleCands = [];
+      for (const t of [group.key, group.titleText]) {
+        const n = normalize(t);
+        if (n && titleCands.indexOf(n) === -1) titleCands.push(n);
+      }
+      for (const field of memberFields) {
+        for (const cand of titleCands) {
+          if (field.candidates.indexOf(cand) === -1) field.candidates.push(cand);
+        }
+      }
+      if (matchFields(entries, memberFields).length > 0) {
         skippedExisting++;
         continue;
       }
@@ -594,7 +1445,7 @@
       fields: results,
       skippedExisting,
       skippedEmpty,
-      found: fieldList.length,
+      found: groups.length,
       frameTop: window === window.top
     };
   }
@@ -724,7 +1575,7 @@ function fillPageAll(activeProfile, force) {
   // normally wins.
   const SPINNER_MAX_AGE_MS = 100000;
 
-  let config = { whitelist: [], profileFields: {} };
+  let config = { whitelist: [], profileFields: {}, debug: false };
 
   async function loadConfig() {
     try {
@@ -738,9 +1589,13 @@ function fillPageAll(activeProfile, force) {
       if (active && active.fields && typeof active.fields === "object") {
         profileFields = active.fields;
       }
-      config = { whitelist: whitelist, profileFields: profileFields };
+      config = {
+        whitelist: whitelist,
+        profileFields: profileFields,
+        debug: mod && mod.debug === true
+      };
     } catch (err) {
-      config = { whitelist: [], profileFields: {} };
+      config = { whitelist: [], profileFields: {}, debug: false };
     }
   }
 
@@ -806,11 +1661,13 @@ function fillPageAll(activeProfile, force) {
   }
 
   // In-page toast via the core content runtime; falls back to the console
-  // when the core runtime is unavailable (harness/edge cases).
+  // when the core runtime is unavailable (harness/edge cases). When debug is
+  // enabled, toast text is also mirrored to the console.
   function toast(text) {
     try {
       if (typeof window.jobAppToolkit.content.showToast === "function") {
         window.jobAppToolkit.content.showToast(text);
+        if (config.debug) console.log("[Form Filler] " + text);
         return;
       }
     } catch (err) {
@@ -819,15 +1676,53 @@ function fillPageAll(activeProfile, force) {
     console.log("[Form Filler] " + text);
   }
 
-  // Does the active profile hold a value matching this field, under the same
-  // identity matching used by fill-page? Returns the match (with its profile
-  // key) or null.
-  function findProfileMatch(el) {
+  // Stage logging for the AI flow (page console). The background sends a short
+  // flow id in every AI message; content logs under the same id so the two
+  // consoles line up. No id (direct harness calls) falls back to "?".
+  function aiLog(flowId, text) {
+    console.log(
+      "[Form Filler AI #" + (flowId || "?") + " " + new Date().toISOString().slice(11, 23) + "] " + text
+    );
+  }
+
+  // Log form of a captured subtitle: the picked-up text in quotes (never the
+  // full 800-char cap), truncated to 200 chars with a total-count suffix.
+  function subtitleLog(sub) {
+    const s = String(sub || "").trim();
+    if (!s) return "none";
+    return s.length > 200
+      ? '"' + s.slice(0, 200) + "…\" (" + s.length + " chars total)"
+      : '"' + s + '"';
+  }
+
+  // Does the active profile hold a value matching this question group, under
+  // the same identity matching used by fill-page? Returns the match (with its
+  // profile key) or null.
+  function findProfileMatch(group) {
     const entries = buildMatchEntries(config.profileFields);
     const matches = matchFields(entries, [
-      { el: el, candidates: getCandidates(el, el.ownerDocument) }
+      { el: group.anchor, candidates: groupCandidates(group) }
     ]);
     return matches.length > 0 ? matches[0] : null;
+  }
+
+  // Matching identities for a question group: the cleaned title/key first,
+  // then every member input's own candidates, so previously-saved scalar
+  // entries (e.g. a lone checkbox or a radio group saved under its shared
+  // name) keep matching alongside the new title-keyed entries.
+  function groupCandidates(group) {
+    const cands = [];
+    const add = (text) => {
+      const norm = normalize(text);
+      if (norm && cands.indexOf(norm) === -1) cands.push(norm);
+    };
+    add(group.key);
+    add(group.titleText);
+    for (const el of group.inputs) {
+      const doc = el.ownerDocument || document;
+      for (const c of getCandidates(el, doc)) add(c);
+    }
+    return cands;
   }
 
   // Build an inline SVG icon in the host document. Must use createElementNS —
@@ -851,10 +1746,10 @@ function fillPageAll(activeProfile, force) {
     return svg;
   }
 
-  function createButtons(el, doc) {
-    // Buttons must be created in the field's own document — for fields inside
-    // a same-origin iframe that is NOT this frame's document.
-    const root = doc || el.ownerDocument || document;
+  function createButtons(group, doc) {
+    // Buttons must be created in the question's own document — for fields
+    // inside a same-origin iframe that is NOT this frame's document.
+    const root = doc || group.inputs[0].ownerDocument || document;
     const wrapper = root.createElement("span");
     wrapper.className = BTN_WRAPPER_CLASS;
 
@@ -872,7 +1767,7 @@ function fillPageAll(activeProfile, force) {
     );
     addBtn.title = "Add this field to profile";
     addBtn.setAttribute("aria-label", "Add this field to profile");
-    addBtn.addEventListener("click", (e) => onAddClick(e, el));
+    addBtn.addEventListener("click", (e) => onAddClick(e, group));
 
     const fillBtn = root.createElement("button");
     fillBtn.type = "button";
@@ -886,19 +1781,27 @@ function fillPageAll(activeProfile, force) {
     );
     fillBtn.title = "Fill this field from profile";
     fillBtn.setAttribute("aria-label", "Fill this field from profile");
-    fillBtn.addEventListener("click", (e) => onFillClick(e, el));
+    fillBtn.addEventListener("click", (e) => onFillClick(e, group));
 
     wrapper.appendChild(addBtn);
     wrapper.appendChild(fillBtn);
     return { wrapper: wrapper, addBtn: addBtn, fillBtn: fillBtn };
   }
 
-  function onAddClick(e, el) {
+  // Save the whole question group: multi-answer questions store an ARRAY of
+  // the selected options' labels/values (possibly []), radio groups store the
+  // checked radio's label/value as a scalar, singles keep their current scalar
+  // behavior. Empty scalars (including an unchecked radio group) are rejected
+  // with a toast exactly like empty single fields.
+  function onAddClick(e, group) {
     e.preventDefault();
     e.stopPropagation();
-    const desc = describeField(el, el.ownerDocument);
+    const desc = describeGroup(group);
     const display = desc.fieldLabel || desc.name;
-    if (desc.value === "" || desc.value === null || desc.value === undefined) {
+    const isEmptyScalar =
+      !Array.isArray(desc.value) &&
+      (desc.value === "" || desc.value === null || desc.value === undefined);
+    if (isEmptyScalar) {
       toast('Field "' + display + '" is empty. Enter a value first.');
       return;
     }
@@ -916,36 +1819,42 @@ function fillPageAll(activeProfile, force) {
       });
   }
 
-  function onFillClick(e, el) {
+  // Fill the whole question group from the active profile (unconditional
+  // override, matching today's single-field semantics): arrays select exactly
+  // the stored options, radio scalars check the matching radio, singles use
+  // fillField. No stored entry → dim + toast as before.
+  function onFillClick(e, group) {
     e.preventDefault();
     e.stopPropagation();
-    const desc = describeField(el, el.ownerDocument);
-    const display = desc.fieldLabel || desc.name;
-    const match = findProfileMatch(el);
-    const entry = buttonMap.get(el);
+    const display =
+      group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+    const match = findProfileMatch(group);
+    const entry = buttonMap.get(group.anchor);
     if (!match) {
       toast('No saved value matches "' + display + '".');
       if (entry) entry.fillBtn.classList.add("jtk-ff-dim");
       return;
     }
-    // Deliberate unconditional overwrite (no isFilled guard): the per-field
+    // Deliberate unconditional overwrite (no isFilled guard): the per-question
     // fill is an explicit override, unlike fill-page. No toast on success —
     // the visible value change is the feedback.
-    fillField(el, match.entry.value);
+    fillGroup(group, match.entry.value);
     if (entry) {
       entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
       entry.fillBtn.classList.remove("jtk-ff-dim");
     }
   }
 
-  // Wrappers are tracked per element (form fields are stable elements, unlike
-  // LinkedIn's recycled cards), so repeated scans reuse the same buttons.
+  // Wrappers are tracked per question GROUP (via its anchor element — the
+  // title element, group container or first input; single inputs key by the
+  // input element as before). Form controls are stable elements, unlike
+  // LinkedIn's recycled cards, so repeated scans reuse the same buttons.
   let buttonMap = new WeakMap();
 
   // Reflect the profile-match state on the fill button only (dim + tooltip
   // naming the matched profile key); the add button never changes.
-  function updateButtonState(entry, el) {
-    const match = findProfileMatch(el);
+  function updateButtonState(entry, group) {
+    const match = findProfileMatch(group);
     if (match) {
       entry.fillBtn.classList.remove("jtk-ff-dim");
       entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
@@ -955,45 +1864,278 @@ function fillPageAll(activeProfile, force) {
     }
   }
 
-  // Vertically center the button pair on the field's row. The wrapper is a
-  // zero-height FLEX container, so its top edge sits just below the field (at
-  // the field's bottom edge, plus any bottom margin the field carries), and
+  // Vertically center the button pair on the question title's row (or the
+  // first input's row when no title element exists). The wrapper is a
+  // zero-height FLEX container, so its top edge sits just below the title (at
+  // the title's bottom edge, plus any bottom margin it carries), and
   // align-items:center pins the 18px pair exactly on that y=0 line — no line
-  // box, no baseline offset. A negative top of -(fieldH/2 + margin) lifts the
-  // pair so it spans the field's vertical middle. Relative positioning only
+  // box, no baseline offset. A negative top of -(titleH/2 + margin) lifts the
+  // pair so it spans the title's vertical middle. Relative positioning only
   // moves painted content, so the wrapper's zero in-flow footprint is
   // unaffected and following fields are never pulled up or down.
-  function positionButtons(entry, el) {
+  function positionButtons(entry, group) {
     // Layout measurement (browser only): jsdom reports 0, so fall back to a
-    // nominal 40px field — the negative top must ALWAYS be applied.
-    const measured = el.getBoundingClientRect().height;
+    // nominal 40px — the negative top must ALWAYS be applied.
+    const target = group.titleEl || group.inputs[0];
+    const measured = target.getBoundingClientRect().height;
     const fieldH = measured > 0 ? measured : 40;
     let marginBottom = 0;
-    const view = el.ownerDocument ? el.ownerDocument.defaultView : null;
+    const view = target.ownerDocument ? target.ownerDocument.defaultView : null;
     if (view && typeof view.getComputedStyle === "function") {
-      const mb = parseFloat(view.getComputedStyle(el).marginBottom);
+      const mb = parseFloat(view.getComputedStyle(target).marginBottom);
       if (isFinite(mb) && mb > 0) marginBottom = Math.min(mb, 40);
     }
     entry.wrapper.style.top = -Math.round(fieldH / 2 + marginBottom) + "px";
   }
 
-  function ensureButtons(el, doc) {
-    let entry = buttonMap.get(el);
+  // One button set PER QUESTION, rendered at the question title when one
+  // exists (next sibling of the legend/label/heading), else at the group's
+  // first input — today's placement.
+  function ensureButtons(group, doc) {
+    const keyEl = group.anchor;
+    let entry = buttonMap.get(keyEl);
     if (entry && entry.wrapper && entry.wrapper.isConnected) {
-      updateButtonState(entry, el);
-      positionButtons(entry, el);
+      updateButtonState(entry, group);
+      positionButtons(entry, group);
       return;
     }
     if (entry && entry.wrapper) {
       entry.wrapper.remove();
-      buttonMap.delete(el);
+      buttonMap.delete(keyEl);
     }
-    entry = createButtons(el, doc);
-    buttonMap.set(el, entry);
-    updateButtonState(entry, el);
-    const parent = el.parentNode;
-    if (parent) parent.insertBefore(entry.wrapper, el.nextSibling);
-    positionButtons(entry, el);
+    entry = createButtons(group, doc);
+    buttonMap.set(keyEl, entry);
+    updateButtonState(entry, group);
+    const titleEl = group.titleEl;
+    if (titleEl && titleEl.parentNode) {
+      titleEl.parentNode.insertBefore(entry.wrapper, titleEl.nextSibling);
+    } else {
+      const first = group.inputs[0];
+      const parent = first.parentNode;
+      if (parent) parent.insertBefore(entry.wrapper, first.nextSibling);
+    }
+    positionButtons(entry, group);
+  }
+
+  // ------------------------------------------------------------------
+  // Application submit logging
+  // ------------------------------------------------------------------
+  //
+  // On whitelisted sites, watch submit-capable controls and report an
+  // application submission to the background (form-filler:logApplication) as
+  // the user activates one — before the page navigates away. Fire-and-forget:
+  // no user-visible effect, never throws.
+
+  // A submit-capable control: <input type=submit|image>, <button
+  // type=submit>, a <button> without a type that belongs to a form (its
+  // default type is submit), or a <button> whose collapsed text reads like a
+  // progression action ("Submit Application", "Save & Continue", ...) — the
+  // JS-button ATS portals. Anchors are never submissions ("Apply" links point
+  // at the posting), and text like "Cancel"/"Save for later"/"Back"/"Delete"
+  // does not match the progression regex.
+  function isSubmitCandidate(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (el.disabled) return false;
+    if (el.tagName === "A") return false;
+    if (el.tagName === "INPUT") {
+      const type = (el.getAttribute("type") || "text").toLowerCase();
+      return type === "submit" || type === "image";
+    }
+    if (el.tagName !== "BUTTON") return false;
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (type === "submit") return true;
+    if (type === "button" || type === "reset") return false;
+    if (el.form) return true; // typeless button in a form defaults to submit
+    const text = collapseWs(el.textContent);
+    if (!text) return false;
+    return /^(submit|apply|applying|continue|next|save\s*&?\s*(and|&)?\s*continue|finish|complete|confirm|proceed)\b/i.test(
+      text
+    );
+  }
+
+  // Best-effort company extraction, in priority order:
+  // 1. the first filled form field whose candidates read as a company question
+  //    (Company / Employer / Organization ...);
+  // 2. JobPosting structured data -> hiringOrganization.name (the employer,
+  //    exactly as the ATS marked it up for crawlers);
+  // 3. the "at <Company>" phrase in the page title (job-board titles read
+  //    "Senior Engineer at Acme Corp | Workday");
+  // 4. the page's og:site_name meta (a real company on company-careers sites,
+  //    the ATS brand on aggregate portals);
+  // else "".
+  function findCompanyOnPage(doc) {
+    const root = doc || document;
+    const hints = ["company", "employer", "organization", "organisation"];
+    const exact = ["companyname", "employername", "organizationname", "organisationname"];
+    try {
+      for (const field of discoverFields(root)) {
+        const hit = field.candidates.some((cand) => {
+          if (exact.indexOf(cand) !== -1) return true;
+          return hints.some(
+            (h) => cand === h || cand.startsWith(h + " ") || cand.endsWith(" " + h)
+          );
+        });
+        if (!hit) continue;
+        const value = String(field.el.value == null ? "" : field.el.value).trim();
+        if (value) return value;
+      }
+    } catch (err) {
+      // Fall through to the structured-data sources.
+    }
+    const jsonLd = companyFromJsonLd(root);
+    if (jsonLd) return jsonLd;
+    const titleCompany = companyFromTitle(root);
+    if (titleCompany) return titleCompany;
+    try {
+      const meta = root.querySelector(
+        'meta[property="og:site_name"], meta[name="og:site_name"]'
+      );
+      if (meta && meta.content) return String(meta.content).trim();
+    } catch (err) {
+      // Ignore.
+    }
+    return "";
+  }
+
+  // JobPosting structured data -> hiringOrganization.name. The ATS emits this
+  // for crawlers, so it is the most accurate company source on job boards.
+  // Handles a single node, an array of nodes, and @type arrays.
+  function companyFromJsonLd(root) {
+    try {
+      const scripts = root.querySelectorAll('script[type="application/ld+json"]');
+      for (const script of scripts) {
+        let data;
+        try {
+          data = JSON.parse(script.textContent);
+        } catch (err) {
+          continue; // malformed block — try the next one
+        }
+        const nodes = Array.isArray(data) ? data : [data];
+        for (const node of nodes) {
+          if (!node || typeof node !== "object") continue;
+          const types = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+          if (types.indexOf("JobPosting") === -1) continue;
+          const org = node.hiringOrganization;
+          if (org && typeof org.name === "string") {
+            const name = collapseWs(org.name);
+            if (name) return name;
+          }
+        }
+      }
+    } catch (err) {
+      // Ignore.
+    }
+    return "";
+  }
+
+  // The page title often reads "Senior Engineer at Acme Corp | Workday" on job
+  // boards. Take the text after " at " up to the first spaced title delimiter
+  // (| – — : -) or the end. Only fires when the " at " phrase is actually
+  // present, so a bare "Company - Title" page falls through to og:site_name.
+  function companyFromTitle(root) {
+    try {
+      const title = String((root && root.title) || "").trim();
+      const m = /\bat\s+(.+)$/i.exec(title);
+      if (!m) return "";
+      const name = m[1].replace(/\s+[-–—|:]\s+.*$/, "").trim();
+      return name ? collapseWs(name) : "";
+    } catch (err) {
+      return "";
+    }
+  }
+
+  // Capture the log message from the document the submission happened in:
+  // the top frame's URL (a cross-origin top throws -> the submitting
+  // document's own URL), the submitting document's title (else the top
+  // document's, else ""), and the best-effort company.
+  function logApplicationFromDoc(doc) {
+    try {
+      let url;
+      try {
+        url = window.top.location.href;
+      } catch (err) {
+        url = doc.location.href;
+      }
+      let title = doc.title;
+      if (!title) {
+        try {
+          title = window.top.document.title;
+        } catch (err) {
+          title = "";
+        }
+      }
+      const company = findCompanyOnPage(doc);
+      browser.runtime
+        .sendMessage({
+          type: "form-filler:logApplication",
+          title: title,
+          url: url,
+          company: company
+        })
+        .catch(() => {});
+    } catch (err) {
+      // Never throw.
+    }
+  }
+
+  // Monitored documents: Map<Document, { click, submit, lastLogAt }> so
+  // teardown() can detach exactly the listeners this frame attached. The
+  // per-document lastLogAt guard stops click+submit double-firing within the
+  // same second (Enter-key and form.requestSubmit() submits carry no click of
+  // their own and are caught by the submit listener alone).
+  const submitMonitors = new Map();
+
+  function handleSubmitClick(e, root) {
+    try {
+      if (!isSubmitCandidate(e.target)) return;
+      const doc = (e.target && e.target.ownerDocument) || root;
+      logApplicationFromDoc(doc);
+      const entry = submitMonitors.get(doc);
+      if (entry) entry.lastLogAt = Date.now();
+    } catch (err) {
+      // Never throw.
+    }
+  }
+
+  function handleSubmitEvent(e, root) {
+    try {
+      const doc = (e.target && e.target.ownerDocument) || root;
+      const entry = submitMonitors.get(doc);
+      if (entry && entry.lastLogAt && Date.now() - entry.lastLogAt < 1000) return;
+      logApplicationFromDoc(doc);
+      if (entry) entry.lastLogAt = Date.now();
+    } catch (err) {
+      // Never throw.
+    }
+  }
+
+  // Attach the click (capture phase — fires before the button's own handlers
+  // and before navigation) and submit listeners to one document. Called from
+  // scanPage for every document in the same-origin walk: each document with
+  // its own content script monitors itself, unmarked same-origin iframes are
+  // monitored by the top frame.
+  function ensureSubmitMonitor(doc) {
+    const root = doc || document;
+    if (submitMonitors.has(root)) return;
+    const click = (e) => handleSubmitClick(e, root);
+    const submit = (e) => handleSubmitEvent(e, root);
+    try {
+      root.addEventListener("click", click, true);
+      root.addEventListener("submit", submit);
+      submitMonitors.set(root, { click: click, submit: submit, lastLogAt: 0 });
+    } catch (err) {
+      // Roll back a partial attach so nothing leaks, then never throw.
+      try {
+        root.removeEventListener("click", click, true);
+      } catch (e2) {
+        // Ignore.
+      }
+      try {
+        root.removeEventListener("submit", submit);
+      } catch (e2) {
+        // Ignore.
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1013,8 +2155,9 @@ function fillPageAll(activeProfile, force) {
     // its own wrapper set.
     forEachSameOriginDoc((doc) => {
       injectStyles(doc);
-      const fields = discoverFields(doc);
-      for (const field of fields) ensureButtons(field.el, doc);
+      ensureSubmitMonitor(doc);
+      const groups = discoverGroups(doc);
+      for (const group of groups) ensureButtons(group, doc);
     });
   }
 
@@ -1035,6 +2178,22 @@ function fillPageAll(activeProfile, force) {
       const style = doc.getElementById(STYLE_ID);
       if (style) style.remove();
     });
+    // Detach the submit-monitoring listeners this frame attached (its own
+    // document and any unmarked same-origin iframes). forEachSameOriginDoc
+    // swallows per-document errors, so the walk is safe when a frame is gone.
+    for (const [doc, fns] of submitMonitors) {
+      try {
+        doc.removeEventListener("click", fns.click, true);
+      } catch (err) {
+        // Ignore.
+      }
+      try {
+        doc.removeEventListener("submit", fns.submit);
+      } catch (err) {
+        // Ignore.
+      }
+    }
+    submitMonitors.clear();
     buttonMap = new WeakMap();
   }
 
@@ -1267,6 +2426,18 @@ function fillPageAll(activeProfile, force) {
     // Module activity broadcasts (jtk:*) are also handled by core/content.js
     // (it caches the active flag); here we attach or tear down the in-page
     // buttons in response to a toggle.
+    // Core message types (jtk:*) — activity broadcasts and toasts — are
+    // handled by core/content.js for rendering. Mirror Form Filler toasts to
+    // the console when debug is enabled, so page-console users see in-page
+    // feedback for background-toasted messages too.
+    if (message.type === "jtk:showToast" && message.module === MODULE_ID && config.debug) {
+      console.log(
+        "[Form Filler] " +
+          (message.title ? message.title + ": " + message.message : message.message)
+      );
+      return undefined;
+    }
+
     if (message.type === "jtk:moduleActivityChanged") {
       if (message.id === MODULE_ID) {
         if (message.active) ensureActive();
@@ -1298,30 +2469,59 @@ function fillPageAll(activeProfile, force) {
     if (type === "getAIFieldInfo") {
       const el = resolveFieldElement(message.targetElementId);
       if (!el) {
+        aiLog(message.flowId, "capture: no fillable field at target " + message.targetElementId);
         return Promise.resolve({
           ok: false,
+          flowId: message.flowId,
           error: "No fillable field at the right-clicked element."
         });
       }
-      return Promise.resolve(describeAIField(el));
+      const desc = describeAIField(el);
+      aiLog(
+        message.flowId,
+        "captured: " + desc.tagName + " " + (desc.type || "") +
+          " name=" + (desc.name || "-") +
+          " label=" + (desc.fieldLabel || "-") +
+          " subtitle=" + subtitleLog(desc.subtitle) +
+          " maxLength=" + (desc.maxLength == null ? "none" : desc.maxLength) +
+          " singleLine=" + (desc.singleLine === true)
+      );
+      return Promise.resolve(Object.assign({ flowId: message.flowId }, desc));
     }
     if (type === "fillAIField") {
+      const value = String(message.value == null ? "" : message.value);
       const el = resolveFieldElement(message.targetElementId);
       if (!el) {
+        aiLog(message.flowId, "fill: target " + message.targetElementId + " no longer available");
         return Promise.resolve({
           ok: false,
+          flowId: message.flowId,
           error: "The field is no longer available on this page."
         });
       }
       if (el.tagName === "SELECT" || el.type === "checkbox") {
-        return Promise.resolve({ ok: false, error: "Not a text field." });
+        aiLog(
+          message.flowId,
+          "fill: rejected, not a text field (" + el.tagName + "/" + (el.type || "") + ")"
+        );
+        return Promise.resolve({ ok: false, flowId: message.flowId, error: "Not a text field." });
       }
-      setNativeValue(el, String(message.value == null ? "" : message.value));
-      return Promise.resolve({ ok: true });
+      aiLog(message.flowId, "fill: applying " + value.length + " chars to target " + message.targetElementId);
+      setNativeValue(el, value);
+      aiLog(
+        message.flowId,
+        "fill applied: " + value.length + " chars -> " + el.tagName +
+          (el.id ? "#" + el.id : el.name ? "[name=" + el.name + "]" : "")
+      );
+      return Promise.resolve({ ok: true, flowId: message.flowId });
     }
     if (type === "aiSpinner") {
       // Background signals the AI answer is in flight: show the ring on the
       // target field (or clear it once the answer lands).
+      aiLog(
+        message.flowId,
+        "spinner " + (message.show !== false ? "show" : "hide") + " target " + message.targetElementId
+      );
       return Promise.resolve(handleAiSpinner(message.show !== false, message.targetElementId));
     }
     return undefined;

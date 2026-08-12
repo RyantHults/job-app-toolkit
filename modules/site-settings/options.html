@@ -33,8 +33,18 @@
     <div class="row toggle-row">
       <label class="toggle">
         <input type="checkbox" id="show-glassdoor-toggle">
-        <span>Show Glassdoor ratings (fetches each company's rating from glassdoor.com)</span>
+        <span>Show Glassdoor ratings</span>
       </label>
+    </div>
+    <div class="row toggle-row">
+      <label class="toggle">
+        <input type="checkbox" id="show-people-company-toggle">
+        <span>Show company on people-search results</span>
+      </label>
+    </div>
+    <div class="row toggle-row people-cache-row" hidden>
+      <button type="button" id="clear-people-cache-btn" class="btn btn-sm">Clear cache</button>
+      <span class="people-cache-stats" id="people-cache-stats"></span>
     </div>
     <div class="columns">
       <div class="column">

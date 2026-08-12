@@ -23,6 +23,7 @@
   const fillBtn = document.getElementById("fill-btn");
   const addFieldBtn = document.getElementById("add-field-btn");
   const addAllFieldsBtn = document.getElementById("add-all-fields-btn");
+  const applicationsBtn = document.getElementById("applications-btn");
   const fieldsList = document.getElementById("fields-list");
   const fieldSearch = document.getElementById("field-search");
   const newProfileBtn = document.getElementById("new-profile-btn");
@@ -47,6 +48,7 @@
   const aiContextSave = document.getElementById("ai-context-save");
   const aiContextCancel = document.getElementById("ai-context-cancel");
   const aiContextDelete = document.getElementById("ai-context-delete");
+  const debugToggle = document.getElementById("debug-toggle");
 
   let data = { active: true, profiles: {}, activeProfile: null, whitelist: [], aiContext: [] };
   let aiKey = "";
@@ -111,6 +113,7 @@
       aiKeyClear.hidden = false;
     }
     activeToggle.checked = data.active === true;
+    debugToggle.checked = data.debug === true;
   }
 
   // Entries are persisted to storage.local FIRST (they are the bulky part the
@@ -123,7 +126,8 @@
       whitelist: data.whitelist,
       aiEndpoint: data.aiEndpoint,
       aiModel: data.aiModel,
-      aiInstructions: data.aiInstructions
+      aiInstructions: data.aiInstructions,
+      debug: data.debug
     });
   }
 
@@ -144,6 +148,17 @@
   function handleError(err) {
     console.error("Form Filler options error:", err);
     ui.setStatus("Something went wrong");
+  }
+
+  // Render a stored field value for display. Multi-answer questions store
+  // arrays of selected option values/labels: show them joined with ", " and a
+  // neutral placeholder when nothing was selected. Everything else renders as
+  // a scalar string exactly as before (legacy bare-string entries included).
+  function displayValue(value) {
+    if (Array.isArray(value)) {
+      return value.length ? value.join(", ") : "(none selected)";
+    }
+    return String(value);
   }
 
   // Normalize a user-typed whitelist entry into a bare hostname: tolerate a
@@ -180,6 +195,16 @@
     const norms = [];
     if (keyNorm) norms.push(keyNorm);
     if (labelNorm && labelNorm !== keyNorm) norms.push(labelNorm);
+    // Multi-answer entries (arrays of selected options) are searchable by any
+    // of their options: normalize the JOINED text so "Java,Python" never
+    // becomes the single token "javapython". Skip empty arrays (nothing to
+    // match) and scalar values (unchanged from legacy behavior).
+    if (isObj && Array.isArray(entry.value) && entry.value.length) {
+      const valueNorm = normalize(entry.value.join(" "));
+      if (valueNorm && valueNorm !== keyNorm && valueNorm !== labelNorm) {
+        norms.push(valueNorm);
+      }
+    }
     return norms;
   }
 
@@ -299,8 +324,9 @@
 
       const valueSpan = document.createElement("span");
       valueSpan.className = "field-value";
-      valueSpan.textContent = String(value);
-      valueSpan.title = String(value);
+      const valueText = displayValue(value);
+      valueSpan.textContent = valueText;
+      valueSpan.title = valueText;
 
       const del = document.createElement("button");
       del.type = "button";
@@ -454,6 +480,16 @@
     }
   });
 
+  debugToggle.addEventListener("change", async () => {
+    try {
+      data.debug = debugToggle.checked;
+      await storage.setModuleData(MODULE_ID, { debug: data.debug });
+      ui.setStatus(data.debug ? "Debug enabled." : "Debug disabled.");
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
   profileSelect.addEventListener("change", () => {
     setActiveProfile(profileSelect.value).catch(handleError);
   });
@@ -508,6 +544,17 @@
       }
     } catch (err) {
       ui.setStatus("Could not read the current page.");
+    }
+  });
+
+  applicationsBtn.addEventListener("click", async () => {
+    try {
+      await browser.tabs.create({
+        url: browser.runtime.getURL("modules/form-filler/applications.html")
+      });
+      ui.setStatus("Opening application history\u2026");
+    } catch (err) {
+      handleError(err);
     }
   });
 
