@@ -1676,10 +1676,12 @@ function fillPageAll(activeProfile, force) {
     console.log("[Form Filler] " + text);
   }
 
-  // Stage logging for the AI flow (page console). The background sends a short
-  // flow id in every AI message; content logs under the same id so the two
-  // consoles line up. No id (direct harness calls) falls back to "?".
+  // Stage logging for the AI flow (page console). Gated behind the module
+  // debug flag — when off, the page console stays quiet; the background still
+  // logs every stage, and with debug on it also mirrors via aiDebugLog.
+  // No id (direct harness calls) falls back to "?".
   function aiLog(flowId, text) {
+    if (!config.debug) return;
     console.log(
       "[Form Filler AI #" + (flowId || "?") + " " + new Date().toISOString().slice(11, 23) + "] " + text
     );
@@ -1997,9 +1999,79 @@ function fillPageAll(activeProfile, force) {
     return "";
   }
 
+  // Walk a parsed JSON-LD value (node, array, or @graph) for a JobPosting.
+  function findJobPostingNode(data) {
+    if (!data) return null;
+    const nodes = Array.isArray(data) ? data : [data];
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node || typeof node !== "object") continue;
+      if (Array.isArray(node["@graph"])) {
+        const nested = findJobPostingNode(node["@graph"]);
+        if (nested) return nested;
+      }
+      const types = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+      if (types.indexOf("JobPosting") !== -1) return node;
+    }
+    return null;
+  }
+
+  // Cap for Ask AI job-description context (keep in sync with background
+  // JOB_DESC_MAX_CHARS). Truncates at a word boundary when possible.
+  const JOB_DESC_MAX_CHARS = 10000;
+
+  function truncateJobDescriptionText(text) {
+    const s = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+    if (s.length <= JOB_DESC_MAX_CHARS) return s;
+    let cut = s.slice(0, JOB_DESC_MAX_CHARS);
+    const m = cut.match(/\s+\S*$/);
+    if (m && m.index > 0) cut = cut.slice(0, m.index);
+    return cut.trim();
+  }
+
+  // JobPosting JSON-LD -> { title, description } for Ask AI. Description may
+  // be HTML; strip to plain text. Empty strings when nothing usable is found.
+  function jobPostingFromJsonLd(root) {
+    const empty = { title: "", description: "" };
+    try {
+      const scripts = (root || document).querySelectorAll(
+        'script[type="application/ld+json"]'
+      );
+      for (let i = 0; i < scripts.length; i++) {
+        let data;
+        try {
+          data = JSON.parse(scripts[i].textContent);
+        } catch (err) {
+          continue;
+        }
+        const node = findJobPostingNode(data);
+        if (!node) continue;
+        const title =
+          typeof node.title === "string" ? collapseWs(node.title) : "";
+        let description = "";
+        if (typeof node.description === "string" && node.description.trim()) {
+          try {
+            const tmp = document.createElement("div");
+            tmp.innerHTML = node.description;
+            description = collapseWs(tmp.textContent || "");
+          } catch (err) {
+            description = collapseWs(
+              String(node.description).replace(/<[^>]+>/g, " ")
+            );
+          }
+        }
+        description = truncateJobDescriptionText(description);
+        if (description) return { title: title, description: description };
+      }
+    } catch (err) {
+      // Ignore.
+    }
+    return empty;
+  }
+
   // JobPosting structured data -> hiringOrganization.name. The ATS emits this
   // for crawlers, so it is the most accurate company source on job boards.
-  // Handles a single node, an array of nodes, and @type arrays.
+  // Handles a single node, an array of nodes, @graph, and @type arrays.
   function companyFromJsonLd(root) {
     try {
       const scripts = root.querySelectorAll('script[type="application/ld+json"]');
@@ -2010,16 +2082,12 @@ function fillPageAll(activeProfile, force) {
         } catch (err) {
           continue; // malformed block — try the next one
         }
-        const nodes = Array.isArray(data) ? data : [data];
-        for (const node of nodes) {
-          if (!node || typeof node !== "object") continue;
-          const types = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
-          if (types.indexOf("JobPosting") === -1) continue;
-          const org = node.hiringOrganization;
-          if (org && typeof org.name === "string") {
-            const name = collapseWs(org.name);
-            if (name) return name;
-          }
+        const node = findJobPostingNode(data);
+        if (!node) continue;
+        const org = node.hiringOrganization;
+        if (org && typeof org.name === "string") {
+          const name = collapseWs(org.name);
+          if (name) return name;
         }
       }
     } catch (err) {
@@ -2487,6 +2555,45 @@ function fillPageAll(activeProfile, force) {
           " singleLine=" + (desc.singleLine === true)
       );
       return Promise.resolve(Object.assign({ flowId: message.flowId }, desc));
+    }
+    if (type === "aiDebugLog") {
+      // Background mirrors Ask AI stages here when debug is on. Never a toast.
+      if (config.debug) {
+        const stage = message.stage == null ? "" : String(message.stage);
+        const detail = message.detail == null || message.detail === ""
+          ? ""
+          : ": " + String(message.detail);
+        console.log(
+          "[Form Filler AI #" + (message.flowId || "?") + " " +
+            new Date().toISOString().slice(11, 23) + "] " + stage + detail
+        );
+      }
+      return Promise.resolve({ ok: true });
+    }
+    if (type === "getJobDescription") {
+      // Top-frame Ask AI fast path: JobPosting JSON-LD on the live page
+      // (Ashby posts this on both the posting and /application URLs).
+      const posting = jobPostingFromJsonLd(document);
+      if (posting.description) {
+        aiLog(
+          message.flowId,
+          "job description: " + posting.description.length + " chars" +
+            (posting.title ? ' ("' + posting.title.slice(0, 80) + '")' : "")
+        );
+        return Promise.resolve({
+          ok: true,
+          flowId: message.flowId,
+          jobTitle: posting.title,
+          jobDescription: posting.description
+        });
+      }
+      aiLog(message.flowId, "job description: none on this document");
+      return Promise.resolve({
+        ok: false,
+        flowId: message.flowId,
+        jobTitle: "",
+        jobDescription: ""
+      });
     }
     if (type === "fillAIField") {
       const value = String(message.value == null ? "" : message.value);

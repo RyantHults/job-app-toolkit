@@ -290,9 +290,10 @@ function skippedText(res) {
   // ---- AI flow logging ----
   // Every AI step logs to the extension (background) console under one short
   // per-invocation id so a hang is traceable stage by stage. The same id is
-  // carried in every message sent to the page, so content-side logs (page
-  // console) line up with these. The API key and full answer text are never
-  // logged.
+  // carried in every message sent to the page. When the module's debug flag
+  // is on, stages are also mirrored to the page console via
+  // form-filler:aiDebugLog (never as a toast). The API key and full answer
+  // text are never logged (previews are capped).
   function aiLog(flowId, stage, detail) {
     console.log(
       "[Form Filler AI #" + flowId + " " + new Date().toISOString().slice(11, 23) + "] " +
@@ -306,6 +307,29 @@ function skippedText(res) {
         stage +
         (detail == null ? "" : ": " + detail)
     );
+  }
+
+  // Short quoted preview for debug logs (single-line, length-capped).
+  function previewText(text, max) {
+    const limit = typeof max === "number" && max > 0 ? max : 160;
+    const s = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+    if (!s) return "(empty)";
+    if (s.length <= limit) return '"' + s + '"';
+    return '"' + s.slice(0, limit) + "\u2026\" (" + s.length + " chars)";
+  }
+
+  // Fire-and-forget mirror of an AI stage to the page console when debug is
+  // on. Sends to the right-clicked frame and, when different, the top frame
+  // so the selected console context still sees it. Never toasts.
+  function mirrorAiDebugLog(tab, frameId, flowId, stage, detail) {
+    const msg = {
+      type: "form-filler:aiDebugLog",
+      flowId: flowId,
+      stage: stage,
+      detail: detail == null ? "" : String(detail)
+    };
+    sendToContent(tab, msg, frameId);
+    if (frameId !== 0) sendToContent(tab, msg, 0);
   }
 
   // Log form of a captured subtitle: the picked-up text in quotes (never the
@@ -337,13 +361,237 @@ function skippedText(res) {
     return cut.trim();
   }
 
+  // ------------------------------------------------------------------
+  // Job-description adapters (Ask AI context from known job boards)
+  // ------------------------------------------------------------------
+  // Cap so a long posting never dominates the prompt / token budget.
+  const JOB_DESC_MAX_CHARS = 10000;
+  // Per-fetch abort for the background HTML fallback (fail-open).
+  const JOB_DESC_FETCH_MS = 10000;
+  // Session cache keyed by the adapter's canonical posting URL.
+  const jobDescCache = new Map();
+
+  // Strip HTML to plain text for JobPosting.description bodies. Uses
+  // DOMParser when available; falls back to tag-stripping regex.
+  function htmlToPlainText(html) {
+    const raw = String(html == null ? "" : html);
+    if (!raw.trim()) return "";
+    try {
+      const doc = new DOMParser().parseFromString(raw, "text/html");
+      const junk = doc.querySelectorAll("script, style, noscript");
+      for (let i = 0; i < junk.length; i++) junk[i].remove();
+      const root = doc.body || doc.documentElement;
+      return String((root && root.textContent) || "")
+        .replace(/\s+/g, " ")
+        .trim();
+    } catch (err) {
+      return raw
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+  }
+
+  // Walk a parsed JSON-LD value (node, array, or @graph) for a JobPosting.
+  function findJobPostingNode(data) {
+    if (!data) return null;
+    const nodes = Array.isArray(data) ? data : [data];
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node || typeof node !== "object") continue;
+      if (Array.isArray(node["@graph"])) {
+        const nested = findJobPostingNode(node["@graph"]);
+        if (nested) return nested;
+      }
+      const types = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+      if (types.indexOf("JobPosting") !== -1) return node;
+    }
+    return null;
+  }
+
+  // Parse JobPosting title + description from an HTML document string.
+  // Returns { title, description } with description plain-text and capped;
+  // empty strings when nothing usable is found.
+  function parseJobPostingFromHtml(html) {
+    const empty = { title: "", description: "" };
+    try {
+      const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+      const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
+      for (let i = 0; i < scripts.length; i++) {
+        let data;
+        try {
+          data = JSON.parse(scripts[i].textContent);
+        } catch (err) {
+          continue;
+        }
+        const node = findJobPostingNode(data);
+        if (!node) continue;
+        const title =
+          typeof node.title === "string" ? String(node.title).replace(/\s+/g, " ").trim() : "";
+        const description = truncateForField(
+          htmlToPlainText(node.description || ""),
+          JOB_DESC_MAX_CHARS
+        );
+        if (description) return { title: title, description: description };
+      }
+    } catch (err) {
+      // Fail-open.
+    }
+    return empty;
+  }
+
+  const ASHBY_JOB_UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  // Ashby hosted boards: jobs.ashbyhq.com/<org>/<uuid>[/application]
+  const ashbyJobDescAdapter = {
+    id: "ashby",
+    match: function (urlStr) {
+      try {
+        const u = new URL(urlStr);
+        const host = u.hostname.toLowerCase().replace(/^www\./, "");
+        if (host !== "jobs.ashbyhq.com") return false;
+        const parts = u.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+        if (parts.length < 2 || !ASHBY_JOB_UUID_RE.test(parts[1])) return false;
+        if (parts.length === 2) return true;
+        return parts.length === 3 && parts[2].toLowerCase() === "application";
+      } catch (err) {
+        return false;
+      }
+    },
+    // Canonical posting URL (strip /application, query, hash) for fetch + cache.
+    resolveFetchUrl: function (urlStr) {
+      try {
+        const u = new URL(urlStr);
+        u.hash = "";
+        u.search = "";
+        let path = u.pathname.replace(/\/+$/, "");
+        path = path.replace(/\/application$/i, "");
+        u.pathname = path || "/";
+        return u.toString().replace(/\/$/, "") || u.origin;
+      } catch (err) {
+        return urlStr;
+      }
+    },
+    extract: function (html) {
+      return parseJobPostingFromHtml(html);
+    }
+  };
+
+  const JOB_DESC_ADAPTERS = [ashbyJobDescAdapter];
+
+  function findJobDescAdapter(urlStr) {
+    for (let i = 0; i < JOB_DESC_ADAPTERS.length; i++) {
+      if (JOB_DESC_ADAPTERS[i].match(urlStr)) return JOB_DESC_ADAPTERS[i];
+    }
+    return null;
+  }
+
+  // Resolve a job description for Ask AI on a supported board. Prefer the top
+  // frame's live DOM (form-filler:getJobDescription); fall back to a short
+  // background fetch of the adapter's canonical posting URL. Fail-open: any
+  // miss/error returns empty strings so answering still proceeds. `source` is
+  // "cache" | "page" | "fetch" | "miss" | "none" for debug logging.
+  async function resolveJobDescription(tabUrl, tab, flowId) {
+    const empty = { title: "", description: "", source: "none", adapterId: "" };
+    const adapter = findJobDescAdapter(tabUrl);
+    if (!adapter) return empty;
+
+    const fetchUrl = adapter.resolveFetchUrl(tabUrl);
+    if (jobDescCache.has(fetchUrl)) {
+      aiLog(flowId, "job description cache hit", fetchUrl);
+      const cached = jobDescCache.get(fetchUrl) || {};
+      return {
+        title: cached.title || "",
+        description: cached.description || "",
+        source: "cache",
+        adapterId: adapter.id
+      };
+    }
+
+    // Fast path: top-frame content script reads JSON-LD from the live page.
+    try {
+      const fromPage = await sendToContent(
+        tab,
+        { type: "form-filler:getJobDescription", flowId: flowId },
+        0
+      );
+      if (fromPage && fromPage.ok && fromPage.jobDescription) {
+        const result = {
+          title: fromPage.jobTitle ? String(fromPage.jobTitle).trim() : "",
+          description: truncateForField(String(fromPage.jobDescription), JOB_DESC_MAX_CHARS)
+        };
+        jobDescCache.set(fetchUrl, result);
+        aiLog(
+          flowId,
+          "job description from page",
+          result.description.length + " chars" +
+            (result.title ? ' ("' + result.title.slice(0, 80) + '")' : "")
+        );
+        return {
+          title: result.title,
+          description: result.description,
+          source: "page",
+          adapterId: adapter.id
+        };
+      }
+    } catch (err) {
+      // Fall through to fetch.
+    }
+
+    const miss = { title: "", description: "", source: "miss", adapterId: adapter.id };
+    const controller = new AbortController();
+    const timer = setTimeout(function () {
+      controller.abort();
+    }, JOB_DESC_FETCH_MS);
+    try {
+      aiLog(flowId, "job description fetch", fetchUrl);
+      const res = await fetch(fetchUrl, {
+        credentials: "include",
+        signal: controller.signal
+      });
+      if (!res.ok) {
+        aiLog(flowId, "job description fetch failed", "HTTP " + res.status);
+        return miss;
+      }
+      const html = await res.text();
+      const parsed = adapter.extract(html) || { title: "", description: "" };
+      if (parsed.description) {
+        jobDescCache.set(fetchUrl, {
+          title: parsed.title || "",
+          description: parsed.description
+        });
+        aiLog(flowId, "job description fetched", parsed.description.length + " chars");
+        return {
+          title: parsed.title || "",
+          description: parsed.description,
+          source: "fetch",
+          adapterId: adapter.id
+        };
+      }
+      aiLog(flowId, "job description parse miss", fetchUrl);
+      return miss;
+    } catch (err) {
+      aiLog(
+        flowId,
+        "job description fetch error",
+        String((err && err.message) || err).slice(0, 200)
+      );
+      return miss;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Build the system + user messages for the AI answer flow. `entries` are the
   // user's stored { title, body } background entries (empty bodies are
   // dropped); `fieldInfo` is the captured field description, so the question,
-  // page context and any length constraints reach the model. `instructions`
-  // is the user-editable system prompt from the options page; when empty (or
-  // whitespace-only) the built-in default is used byte-identical. The user
-  // message is fixed.
+  // optional job description, page context and any length constraints reach
+  // the model. `instructions` is the user-editable system prompt from the
+  // options page; when empty (or whitespace-only) the built-in default is
+  // used byte-identical. The user message is fixed.
   function buildPrompt(entries, fieldInfo, instructions) {
     fieldInfo = fieldInfo || {};
     const system =
@@ -362,6 +610,10 @@ function skippedText(res) {
       .join("\n");
     const questionText = fieldInfo.fieldLabel || fieldInfo.name || "";
     const subtitleText = fieldInfo.subtitle ? String(fieldInfo.subtitle).trim() : "";
+    const jobDescText = fieldInfo.jobDescription
+      ? String(fieldInfo.jobDescription).trim()
+      : "";
+    const jobTitleText = fieldInfo.jobTitle ? String(fieldInfo.jobTitle).trim() : "";
     const contextText = fieldInfo.pageTitle
       ? "Context: applying via " + fieldInfo.pageTitle
       : "";
@@ -375,9 +627,15 @@ function skippedText(res) {
       : "";
 
     // Default user message: fixed scaffolding; the "Constraints:" section is
-    // only present when the field actually has constraints.
+    // only present when the field actually has constraints. Job description
+    // (when an adapter found one) sits between Background and Question.
     const lines = ["Background:"];
     if (backgroundText) lines.push(backgroundText);
+    if (jobDescText) {
+      lines.push("", "Job description:");
+      if (jobTitleText) lines.push(jobTitleText);
+      lines.push(jobDescText);
+    }
     lines.push("", "Question: " + questionText);
     if (subtitleText) lines.push("Additional context: " + subtitleText);
     if (contextText) lines.push(contextText);
@@ -584,22 +842,39 @@ function skippedText(res) {
   // most one corrective retry, truncate to the field's maxlength, fill the
   // field and toast the outcome. A spinner on the target field covers the AI
   // work. Text fields only; fills overwrite any existing text by design.
+  // When module debug is on, every stage is also mirrored to the page console
+  // (form-filler:aiDebugLog) — never as a toast.
   async function answerFieldWithAI(info, tab, api) {
     const flowId = Math.random().toString(36).slice(2, 8);
-    aiLog(
-      flowId,
+    const frameId = info.frameId == null ? 0 : info.frameId;
+    const flowStartedAt = Date.now();
+    const modData = await api.getModuleData(MODULE_ID);
+    const debug = modData && modData.debug === true;
+
+    // Background console always; page console only when debug is on.
+    function dbg(stage, detail) {
+      aiLog(flowId, stage, detail);
+      if (debug) mirrorAiDebugLog(tab, frameId, flowId, stage, detail);
+    }
+    function dbgError(stage, detail) {
+      aiError(flowId, stage, detail);
+      if (debug) mirrorAiDebugLog(tab, frameId, flowId, stage, detail);
+    }
+
+    dbg(
       "menu click",
-      "tab " + tab.id + ", frame " + (info.frameId == null ? 0 : info.frameId) +
-        ", target " + info.targetElementId
+      "tab " + tab.id + ", frame " + frameId +
+        ", target " + info.targetElementId +
+        ", url " + String(tab.url || "").slice(0, 160) +
+        (debug ? " | debug on" : "")
     );
     const captured = await sendToContent(
       tab,
       { type: "form-filler:getAIFieldInfo", flowId: flowId, targetElementId: info.targetElementId },
-      info.frameId
+      frameId
     );
     if (!captured || !captured.ok) {
-      aiError(
-        flowId,
+      dbgError(
         "capture failed",
         (captured && captured.error) || "no response from the page (content script inactive in that frame?)"
       );
@@ -612,24 +887,24 @@ function skippedText(res) {
       );
       return;
     }
-    aiLog(
-      flowId,
+    dbg(
       "captured",
       captured.tagName + " " + (captured.type || "") +
         " name=" + (captured.name || "-") +
         " label=" + (captured.fieldLabel || "-") +
         " subtitle=" + subtitleLog(captured.subtitle) +
         " maxLength=" + (captured.maxLength == null ? "none" : captured.maxLength) +
-        " singleLine=" + (captured.singleLine === true)
+        " singleLine=" + (captured.singleLine === true) +
+        (captured.pageTitle ? " pageTitle=" + previewText(captured.pageTitle, 80) : "")
     );
     if (captured.tagName === "SELECT" || captured.type === "checkbox") {
-      aiLog(flowId, "abort: not a text field", captured.tagName + "/" + (captured.type || ""));
+      dbg("abort: not a text field", captured.tagName + "/" + (captured.type || ""));
       api.notify(tab.id, "Job App Toolkit", "AI can only fill text fields.", null, "form-filler");
       return;
     }
     const question = captured.fieldLabel || captured.name || "";
     if (!question) {
-      aiLog(flowId, "abort: no question text on the field");
+      dbg("abort: no question text on the field");
       api.notify(
         tab.id,
         "Job App Toolkit",
@@ -641,7 +916,7 @@ function skippedText(res) {
     }
     const config = await readAIConfig(api);
     if (!config.apiKey) {
-      aiLog(flowId, "abort: no API key configured", "set it in the Form Filler options page");
+      dbg("abort: no API key configured", "set it in the Form Filler options page");
       api.notify(
         tab.id,
         "Job App Toolkit",
@@ -652,7 +927,7 @@ function skippedText(res) {
       return;
     }
     if (!config.endpoint) {
-      aiLog(flowId, "abort: no endpoint configured", "set it in the Form Filler options page");
+      dbg("abort: no endpoint configured", "set it in the Form Filler options page");
       api.notify(
         tab.id,
         "Job App Toolkit",
@@ -663,7 +938,7 @@ function skippedText(res) {
       return;
     }
     if (!config.model) {
-      aiLog(flowId, "abort: no model configured", "set it in the Form Filler options page");
+      dbg("abort: no model configured", "set it in the Form Filler options page");
       api.notify(
         tab.id,
         "Job App Toolkit",
@@ -677,7 +952,7 @@ function skippedText(res) {
       (e) => e && typeof e.body === "string" && e.body.trim() !== ""
     );
     if (usableEntries.length === 0) {
-      aiLog(flowId, "abort: no usable background entries", "add them in the Form Filler options page");
+      dbg("abort: no usable background entries", "add them in the Form Filler options page");
       api.notify(
         tab.id,
         "Job App Toolkit",
@@ -694,8 +969,7 @@ function skippedText(res) {
       null,
       "form-filler"
     );
-    aiLog(
-      flowId,
+    dbg(
       "config",
       "endpoint " + config.endpoint +
         " | model " + config.model +
@@ -706,16 +980,11 @@ function skippedText(res) {
           : " | default instructions")
     );
 
-    const prompt = buildPrompt(config.entries, captured, config.instructions);
-    aiLog(
-      flowId,
-      "prompt built",
-      "question \u201c" + question + "\u201d | user message " + prompt.user.length +
-        " chars | system " + prompt.system.length + " chars"
-    );
     // Spinner on the target field while the AI work runs; hidden on every
     // terminal path below (API error, fill failure, success). It stays visible
     // across evaluation and the corrective retry (no hide between attempts).
+    // Shown before the job-description lookup so the user gets immediate
+    // feedback while the (rare) background fetch of the posting runs.
     sendToContent(
       tab,
       {
@@ -724,26 +993,77 @@ function skippedText(res) {
         flowId: flowId,
         targetElementId: info.targetElementId
       },
-      info.frameId
+      frameId
     );
-    aiLog(flowId, "spinner shown", "target " + info.targetElementId);
+    dbg("spinner shown", "target " + info.targetElementId);
 
     // Overall flow deadline: the spinner must never sit through the full worst
-    // case (generation + judge + retry, each up to aiTimeouts.call). The timer
-    // is cleared in the finally below, which also covers the fill path, so a
-    // late fire can't toast a false timeout after a successful fill.
+    // case (generation + judge + retry, each up to aiTimeouts.call). Armed
+    // before the job-description lookup so the posting fetch counts inside the
+    // flow budget (the lookup has its own much shorter cap, so this just keeps
+    // the whole flow bounded). The timer is cleared in the finally below, which
+    // also covers the fill path, so a late fire can't toast a false timeout
+    // after a successful fill.
     const flowAbort = new AbortController();
     let flowTimedOut = false;
     const flowTimer = setTimeout(function () {
       flowTimedOut = true;
       flowAbort.abort();
     }, aiTimeouts.flow);
-    aiLog(flowId, "flow deadline armed", aiTimeouts.flow + "ms");
+    dbg("flow deadline armed", aiTimeouts.flow + "ms");
 
     let text;
     let retries = 0;
     try {
+      // Optional job-posting context from a known board adapter (Ashby first).
+      // Fail-open: an empty result leaves the prompt unchanged from before.
+      // Runs inside the flow try so a lookup failure hides the spinner and
+      // toasts cleanly instead of leaving it hanging. Copy the capture so we
+      // never leave sticky jobDescription on a reused object (harnesses stub a
+      // single captureResponse).
+      const jd = await resolveJobDescription(tab.url, tab, flowId);
+      const fieldInfo = Object.assign({}, captured);
+      if (jd && jd.description) {
+        fieldInfo.jobDescription = jd.description;
+        fieldInfo.jobTitle = jd.title || "";
+        dbg(
+          "job description",
+          (jd.adapterId || "?") + " via " + (jd.source || "?") +
+            ", " + jd.description.length + " chars" +
+            (jd.title ? ", title=" + previewText(jd.title, 80) : "") +
+            (debug ? "; preview=" + previewText(jd.description, 160) : "")
+        );
+      } else {
+        delete fieldInfo.jobDescription;
+        delete fieldInfo.jobTitle;
+        dbg(
+          "job description",
+          jd && jd.adapterId
+            ? jd.adapterId + " matched, no description (" + (jd.source || "miss") + ")"
+            : "no adapter for this URL"
+        );
+      }
+
+      const prompt = buildPrompt(config.entries, fieldInfo, config.instructions);
+      const promptParts = [
+        "background=" + usableEntries.length + " entries",
+        "jobDescription=" + (fieldInfo.jobDescription ? "yes" : "no"),
+        "question",
+        fieldInfo.subtitle ? "subtitle" : null,
+        fieldInfo.pageTitle ? "pageTitle" : null,
+        (typeof fieldInfo.maxLength === "number" && fieldInfo.maxLength > 0) || fieldInfo.singleLine
+          ? "constraints"
+          : null
+      ].filter(Boolean);
+      dbg(
+        "prompt built",
+        "question \u201c" + question + "\u201d | user " + prompt.user.length +
+          " chars | system " + prompt.system.length + " chars | sections: " +
+          promptParts.join(", ")
+      );
       try {
+        dbg("generate start", "model " + config.model);
+        const genStartedAt = Date.now();
         text = await callLLM(
           config.endpoint,
           config.apiKey,
@@ -758,14 +1078,26 @@ function skippedText(res) {
           flowId,
           "generate"
         );
+        dbg(
+          "generate done",
+          text.length + " chars in " + (Date.now() - genStartedAt) + "ms" +
+            (debug ? "; preview=" + previewText(text, 160) : "")
+        );
 
         // Hybrid self-check: deterministic checks first, then an LLM judge,
         // then at most ONE corrective retry when either finds a problem.
         let violations = runDeterministicChecks(text, captured);
         let feedback = violations.length ? violations.join("; ") : null;
+        if (violations.length) {
+          dbg("deterministic check failed", feedback);
+        } else {
+          dbg("deterministic check", "pass");
+        }
         if (!feedback) {
           // LLM judge — only when the deterministic checks are clean.
           try {
+            dbg("judge start");
+            const judgeStartedAt = Date.now();
             const judgeMessages = buildJudgeMessages(prompt.system, prompt.user, text);
             const judge = await callLLM(
               config.endpoint,
@@ -782,10 +1114,10 @@ function skippedText(res) {
               "judge"
             );
             const res = parseJudgeResult(judge);
-            aiLog(
-              flowId,
+            dbg(
               "judge verdict",
-              res.pass ? "PASS" : "FAIL \u2014 " + String(res.reason || "").slice(0, 120)
+              (res.pass ? "PASS" : "FAIL \u2014 " + String(res.reason || "").slice(0, 120)) +
+                " (" + (Date.now() - judgeStartedAt) + "ms)"
             );
             if (!res.pass) feedback = res.reason;
           } catch (err) {
@@ -793,18 +1125,19 @@ function skippedText(res) {
             // the overall flow deadline fired, in which case surface the
             // timeout instead of filling the original answer.
             if (flowAbort.signal.aborted) throw err;
-            aiError(flowId, "judge failed (filling answer anyway)", err);
+            dbgError("judge failed (filling answer anyway)", err);
           }
         }
         if (feedback) {
           retries = 1;
-          aiLog(flowId, "self-check failed, retrying", feedback.slice(0, 200));
+          dbg("self-check failed, retrying", feedback.slice(0, 200));
           const retryMessages = [
             { role: "system", content: prompt.system },
             { role: "user", content: prompt.user },
             { role: "assistant", content: text },
             ...buildRetryMessages(prompt.system, prompt.user, text, feedback)
           ];
+          const retryStartedAt = Date.now();
           text = await callLLM(
             config.endpoint,
             config.apiKey,
@@ -816,8 +1149,14 @@ function skippedText(res) {
             flowId,
             "retry"
           );
+          dbg(
+            "retry done",
+            text.length + " chars in " + (Date.now() - retryStartedAt) + "ms" +
+              (debug ? "; preview=" + previewText(text, 160) : "")
+          );
           const still = runDeterministicChecks(text, captured);
-          if (still.length) aiLog(flowId, "retry still violates", still.join("; "));
+          if (still.length) dbg("retry still violates", still.join("; "));
+          else dbg("retry deterministic check", "pass");
         }
       } catch (err) {
         const failKind =
@@ -826,7 +1165,10 @@ function skippedText(res) {
             : err && err.name === "AbortError"
               ? "call timeout (" + aiTimeouts.call + "ms)"
               : "error";
-        aiError(flowId, "answer flow failed [" + failKind + "]", String((err && err.message) || err).slice(0, 300));
+        dbgError(
+          "answer flow failed [" + failKind + "]",
+          String((err && err.message) || err).slice(0, 300)
+        );
         sendToContent(
           tab,
           {
@@ -835,7 +1177,7 @@ function skippedText(res) {
             flowId: flowId,
             targetElementId: info.targetElementId
           },
-          info.frameId
+          frameId
         );
         const msg =
           flowTimedOut === true
@@ -849,7 +1191,7 @@ function skippedText(res) {
 
       if (flowAbort.signal.aborted) {
         // Deadline fired between the last LLM call and the fill.
-        aiLog(flowId, "flow deadline reached before fill");
+        dbg("flow deadline reached before fill");
         sendToContent(
           tab,
           {
@@ -858,7 +1200,7 @@ function skippedText(res) {
             flowId: flowId,
             targetElementId: info.targetElementId
           },
-          info.frameId
+          frameId
         );
         api.notify(
           tab.id,
@@ -873,12 +1215,12 @@ function skippedText(res) {
       let answer = text;
       if (captured.singleLine) answer = answer.replace(/\r?\n/g, " "); // harden single-line
       answer = truncateForField(answer, captured.maxLength); // final truncation
-      aiLog(
-        flowId,
+      dbg(
         "answer ready",
         text.length + " chars raw -> " + answer.length + " chars after truncation (maxLength " +
           (captured.maxLength == null ? "none" : captured.maxLength) + ")" +
-          (retries ? " (retried 1x)" : "")
+          (retries ? " (retried 1x)" : "") +
+          (debug ? "; preview=" + previewText(answer, 160) : "")
       );
       const filled = await sendToContent(
         tab,
@@ -888,11 +1230,11 @@ function skippedText(res) {
           targetElementId: info.targetElementId,
           value: answer
         },
-        info.frameId
+        frameId
       );
-      aiLog(flowId, "fill response", filled && filled.ok ? "ok" : JSON.stringify(filled));
+      dbg("fill response", filled && filled.ok ? "ok" : JSON.stringify(filled));
       if (!filled || !filled.ok) {
-        aiError(flowId, "fill rejected by the page", (filled && filled.error) || "no response");
+        dbgError("fill rejected by the page", (filled && filled.error) || "no response");
         sendToContent(
           tab,
           {
@@ -901,7 +1243,7 @@ function skippedText(res) {
             flowId: flowId,
             targetElementId: info.targetElementId
           },
-          info.frameId
+          frameId
         );
         api.notify(
           tab.id,
@@ -920,13 +1262,13 @@ function skippedText(res) {
           flowId: flowId,
           targetElementId: info.targetElementId
         },
-        info.frameId
+        frameId
       );
-      aiLog(
-        flowId,
+      dbg(
         "filled",
         "\u201c" + question + "\u201d (" + answer.length + " chars)" +
-          (answer.length < text.length ? " [truncated to fit]" : "")
+          (answer.length < text.length ? " [truncated to fit]" : "") +
+          " | total " + (Date.now() - flowStartedAt) + "ms"
       );
       api.notify(
         tab.id,
@@ -1474,6 +1816,14 @@ async function fillPageAction(api) {
     buildJudgeMessages: buildJudgeMessages,
     parseJudgeResult: parseJudgeResult,
     buildRetryMessages: buildRetryMessages,
-    timeouts: aiTimeouts
+    timeouts: aiTimeouts,
+    htmlToPlainText: htmlToPlainText,
+    parseJobPostingFromHtml: parseJobPostingFromHtml,
+    findJobDescAdapter: findJobDescAdapter,
+    resolveJobDescription: resolveJobDescription,
+    jobDescCache: jobDescCache,
+    JOB_DESC_MAX_CHARS: JOB_DESC_MAX_CHARS,
+    JOB_DESC_ADAPTERS: JOB_DESC_ADAPTERS,
+    previewText: previewText
   };
 })();
