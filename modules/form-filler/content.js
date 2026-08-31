@@ -52,6 +52,19 @@
       .trim();
   }
 
+  // Coarse control type for a fillable element, used by type-aware matching:
+  // "text" (any non-choice input), "textarea", "checkbox", "radio", "select".
+  // Non-control elements (e.g. a group's title anchor) fall back to "text" —
+  // callers pass a real control when the type matters.
+  function elementType(el) {
+    if (!el) return "text";
+    if (el.type === "checkbox") return "checkbox";
+    if (el.type === "radio") return "radio";
+    if (el.tagName === "SELECT") return "select";
+    if (el.tagName === "TEXTAREA") return "textarea";
+    return "text";
+  }
+
   // ------------------------------------------------------------------
   // Field discovery
   // ------------------------------------------------------------------
@@ -103,6 +116,16 @@
   function walkHeaderLike(el, doc) {
     const root = doc || document;
     if (!root.body || !root.body.contains(el)) return null;
+    // Bounded proximity first: a short text-only element sitting just before
+    // one of the field's nearby ancestors reads as THIS question's title.
+    // Trying it before the document-order walk keeps the walk from reaching
+    // past the question and latching onto a distant section heading (which
+    // the section-header pre-pass would then suppress, leaving the field
+    // unnamed). Boards like Gem render titles as plain hashed-class spans
+    // invisible to HEADER_SELECTOR, so without this the whole page's fields
+    // resolve to the last <h2> above the form.
+    const near = nearestPrecedingTextSibling(el, root);
+    if (near) return near;
     const walker = root.createTreeWalker(root.body, NodeFilter.SHOW_ELEMENT);
     walker.currentNode = el;
     let node;
@@ -123,6 +146,32 @@
     if (fieldset) {
       const legend = fieldset.querySelector(":scope > legend");
       if (legend && legend.textContent.trim() !== "") return legend;
+    }
+    return null;
+  }
+
+  // Last-resort title heuristic for boards whose question titles are plain
+  // <span>/<div> elements with hashed utility classes (e.g. Gem's
+  // `bodyImportant-47`) — invisible to HEADER_SELECTOR and to every label
+  // mechanism. Walks up a few ancestor levels from the field and takes the
+  // nearest PRECEDING SIBLING that holds short plain text and no form
+  // controls; that reads as the question title. Only reached when the
+  // header-selector walk and any fieldset legend both found nothing, so it
+  // never displaces a real heading, label, or legend. The section-header
+  // pre-pass still guards against one sibling being shared by several
+  // questions.
+  function nearestPrecedingTextSibling(el, root) {
+    let node = el;
+    for (let depth = 0; node && depth < 5 && node !== root.body; depth++) {
+      let sib = node.previousElementSibling;
+      while (sib) {
+        if (!sib.querySelector("input, select, textarea, button")) {
+          const text = String(sib.textContent || "").trim();
+          if (text.length > 0 && text.length < 200) return sib;
+        }
+        sib = sib.previousElementSibling;
+      }
+      node = node.parentElement;
     }
     return null;
   }
@@ -709,12 +758,13 @@
         continue;
       }
       const label = isObj && entry.label ? entry.label : key;
+      const entryType = isObj && entry.type ? entry.type : "";
       const norms = [];
       const keyNorm = normalize(key);
       if (keyNorm) norms.push(keyNorm);
       const labelNorm = normalize(label);
       if (labelNorm && labelNorm !== keyNorm) norms.push(labelNorm);
-      entries.push({ key, value, norms });
+      entries.push({ key, value, norms, type: entryType });
     }
     return entries;
   }
@@ -733,6 +783,10 @@
       for (const norm of entry.norms) {
         for (const field of fieldList) {
           if (usedFields.has(field.el)) continue;
+          // Type compatibility: an entry that specifies a type only matches
+          // elements of that type. Empty/missing entry type means "any type"
+          // (backward compatible with old profiles).
+          if (entry.type && entry.type !== elementType(field.el)) continue;
           if (field.candidates.includes(norm)) {
             matches.push({ key: entry.key, entry, field });
             usedFields.add(field.el);
@@ -750,6 +804,7 @@
       let best = null;
       for (const field of fieldList) {
         if (usedFields.has(field.el)) continue;
+        if (entry.type && entry.type !== elementType(field.el)) continue;
         for (let i = 0; i < field.candidates.length; i++) {
           const cand = field.candidates[i];
           for (const norm of entry.norms) {
@@ -783,6 +838,7 @@
       let best = null;
       for (const field of fieldList) {
         if (usedFields.has(field.el)) continue;
+        if (entry.type && entry.type !== elementType(field.el)) continue;
         for (let i = 0; i < field.candidates.length; i++) {
           const cand = field.candidates[i];
           for (const norm of entry.norms) {
@@ -1054,6 +1110,17 @@
 
   function fillPage(activeProfile, doc) {
     const root = doc || document;
+
+    // Page template check: if a saved template matches this page's field
+    // shape, fill from it (positional overwrite) and return immediately — the
+    // normal profile-based matching below is never reached. No match → the
+    // profile fill runs exactly as before.
+    const _shape = computePageShape(root);
+    const _tmpl = findMatchingTemplate(_shape);
+    if (_tmpl) {
+      return fillFromTemplate(_tmpl, root);
+    }
+
     const profile = activeProfile && typeof activeProfile === "object" ? activeProfile : {};
     const fields =
       profile.fields && typeof profile.fields === "object" ? profile.fields : {};
@@ -1102,6 +1169,27 @@
       const group = groupByEl.get(el);
       const isGroupQuestion = group && (group.kind === "radio" || group.kind === "multiChoice");
 
+      // Wrong-autofill correction: a stored exclusion for this profile-entry ↔
+      // field pairing skips the fill. The entry DID match a field, so it counts
+      // as skipped, never unmatched. Ungrouped singles (no group object) check
+      // the matched element's own candidates via a group-less pseudo identity.
+      if (
+        group
+          ? isExcluded(m.key, group)
+          : isExcluded(m.key, { key: null, titleText: null, inputs: [el] })
+      ) {
+        matchedKeys.add(m.key);
+        if (isGroupQuestion) {
+          if (handledGroups.has(group)) continue;
+          handledGroups.add(group);
+        }
+        skipped++;
+        skippedNames.push(
+          group ? group.titleText || group.key : getFieldTitle(el, root) || el.name || el.id
+        );
+        continue;
+      }
+
       if (isGroupQuestion) {
         matchedKeys.add(m.key);
         if (handledGroups.has(group)) continue;
@@ -1122,6 +1210,7 @@
         } else {
           fillGroup(group, target);
           filled++;
+          showClearButton(group);
         }
         continue;
       }
@@ -1142,11 +1231,12 @@
       if (fillField(el, target)) {
         filled++;
         matchedKeys.add(m.key);
+        showClearButton(group);
       }
     }
 
     const unmatched = entries.filter((e) => !matchedKeys.has(e.key)).length;
-    return { filled, skipped, skippedNames, unmatched, matched: matchedKeys.size };
+    return { filled, skipped, skippedNames, unmatched, matched: matchedKeys.size, matchedKeys: Array.from(matchedKeys) };
   }
 
   // Human-readable title for a field: explicit label text and any title/heading
@@ -1256,6 +1346,24 @@
     return findFieldNear(document.activeElement);
   }
 
+  // Resolve the field for an AI-flow message. Tries the live menu target
+  // first; if that weak reference has died (the AI wait can outlive it), falls
+  // back to the element snapshot cached under the flow's id at capture time.
+  // The cache entry is consumed on first use so a stale snapshot can never
+  // outlive its flow.
+  function resolveAiField(targetElementId, flowId) {
+    const el = resolveFieldElement(targetElementId);
+    if (el) {
+      if (flowId) aiFieldCache.delete(flowId);
+      return el;
+    }
+    if (!flowId) return null;
+    const cached = aiFieldCache.get(flowId);
+    aiFieldCache.delete(flowId);
+    if (cached && cached.isConnected) return cached;
+    return null;
+  }
+
   // Shared extraction of the { name, value, fieldLabel } triple for a field.
   // Used by the focused-field capture, the page-wide collect, and the in-page
   // save/up-arrow buttons so all three describe a field identically. A
@@ -1284,7 +1392,7 @@
     if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
 
     const value = el.type === "checkbox" ? String(el.checked) : el.value;
-    return { name, value, fieldLabel };
+    return { name, value, fieldLabel, type: elementType(el) };
   }
 
   // Describe a QUESTION GROUP for the save flow: the storage key (cleaned
@@ -1324,7 +1432,7 @@
         }
       }
     }
-    return { name, value, fieldLabel };
+    return { name, value, fieldLabel, type: elementType(group.inputs[0]) };
   }
 
   function getFocusedField(targetElementId) {
@@ -1368,12 +1476,15 @@
       maxLength:
         typeof el.maxLength === "number" && el.maxLength > 0 ? el.maxLength : null,
       singleLine: el.tagName === "INPUT",
-      type:
-        el.tagName === "INPUT" ? el.getAttribute("type") || "text" : el.tagName.toLowerCase(),
       tagName: el.tagName,
       pageTitle: (el.ownerDocument || document).title || "",
       subtitle: fieldSubtitle(el, el.ownerDocument),
-      ...describeField(el, el.ownerDocument)
+      ...describeField(el, el.ownerDocument),
+      // The AI flow's own raw type (the input's type attribute, or the tag
+      // name lowercased) must win over describeField's coarse normalized type
+      // — the background uses it to reject non-text fields and log captures.
+      type:
+        el.tagName === "INPUT" ? el.getAttribute("type") || "text" : el.tagName.toLowerCase()
     };
   }
 
@@ -1520,13 +1631,267 @@
     return all;
   }
 
+  // ------------------------------------------------------------------
+  // Page templates (save / fill by page shape)
+  // ------------------------------------------------------------------
+  //
+  // A saved template records the ordered, normalized identity of every
+  // question group on a page plus the values captured at save time. When
+  // "Autofill page" runs, the current page's shape is compared against saved
+  // templates first: an exact shape match triggers a POSITIONAL overwrite fill
+  // (the i-th template entry fills the i-th group, by document order), unlike
+  // the profile-based fillPage which never overwrites existing data. No match
+  // → the normal profile matching runs unchanged.
+
+  let savedTemplates = []; // Array of { id, name, shape, fields, savedUrl, createdAt }
+
+  async function reloadTemplates() {
+    try {
+      const res = await browser.storage.local.get(TEMPLATES_LOCAL);
+      const map = res && res[TEMPLATES_LOCAL];
+      savedTemplates = [];
+      if (map && typeof map === "object") {
+        for (const id of Object.keys(map)) {
+          const t = map[id];
+          if (!t || typeof t.name !== "string" || !Array.isArray(t.shape) || !Array.isArray(t.fields)) continue;
+          savedTemplates.push({
+            id: id,
+            name: t.name,
+            shape: t.shape,
+            fields: t.fields,
+            savedUrl: t.savedUrl || "",
+            createdAt: t.createdAt || 0
+          });
+        }
+      }
+    } catch (err) {
+      savedTemplates = [];
+    }
+  }
+
+  // The identity a question group contributes to a page shape: normalized
+  // title text first, then the cleaned storage key, then the first input's
+  // name/id. The same resolution is used when saving and when matching, so a
+  // template recorded on one site matches the same-shaped page on another.
+  function groupIdentity(g) {
+    return normalize(
+      g.titleText || g.key || (g.inputs[0] && (g.inputs[0].name || g.inputs[0].id)) || ""
+    );
+  }
+
+  // Ordered normalized identities — one per question group in document order.
+  // Groups with an empty identity are skipped (they contribute nothing to the
+  // shape, exactly as when saving).
+  function computePageShape(root) {
+    const groups = discoverGroups(root || document);
+    const shape = [];
+    for (const g of groups) {
+      const identity = groupIdentity(g);
+      if (!identity) continue;
+      shape.push(identity);
+    }
+    return shape;
+  }
+
+  // First saved template whose shape matches the given shape exactly (same
+  // length, same value at every index). Null when nothing matches.
+  function findMatchingTemplate(shape) {
+    if (!shape.length) return null;
+    for (const t of savedTemplates) {
+      if (t.shape.length !== shape.length) continue;
+      let match = true;
+      for (let i = 0; i < shape.length; i++) {
+        if (t.shape[i] !== shape[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return t;
+    }
+    return null;
+  }
+
+  // Positional overwrite fill: the i-th identifiable group receives the i-th
+  // template entry's value. Returns a fillPageAll-compatible result; the extra
+  // templateUsed field lets fillPageAll report the template name to the caller
+  // (so the background can toast "Filled from template: X").
+  function fillFromTemplate(template, root) {
+    const groups = discoverGroups(root || document);
+    // Same empty-identity filter as computePageShape, so each group's position
+    // here matches its identity's position in the shape.
+    const identifiable = [];
+    for (const g of groups) {
+      if (groupIdentity(g)) identifiable.push(g);
+    }
+    let filled = 0;
+    for (let i = 0; i < template.fields.length && i < identifiable.length; i++) {
+      fillGroup(identifiable[i], template.fields[i].value);
+      filled++;
+    }
+    return {
+      filled: filled,
+      skipped: 0,
+      unmatched: Math.max(0, template.fields.length - identifiable.length),
+      matchedKeys: template.fields.map(function (f) {
+        return f.identity;
+      }),
+      skippedNames: [],
+      templateUsed: template.name
+    };
+  }
+
+  // One-off naming dialog for "Save page template". Built with DOM APIs and
+  // inline styles only (this is a transient overlay, not a recurring element
+  // like the per-field buttons, so no injected stylesheet). Lives in the top
+  // document's body; removed on confirm, cancel, backdrop click, or teardown.
+  // Enter saves, Escape cancels, an empty name keeps the dialog open.
+  let templatePromptEl = null;
+
+  function showTemplatePrompt(onConfirm, onCancel) {
+    removeTemplatePrompt();
+    const doc = document;
+    const overlay = doc.createElement("div");
+    overlay.className = "jtk-ff-prompt";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    Object.assign(overlay.style, {
+      position: "fixed",
+      inset: "0",
+      background: "rgba(0, 0, 0, 0.5)",
+      zIndex: "2147483647",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center"
+    });
+
+    const box = doc.createElement("div");
+    Object.assign(box.style, {
+      maxWidth: "360px",
+      width: "80vw",
+      boxSizing: "border-box",
+      padding: "20px",
+      borderRadius: "8px",
+      background: "#1f2937",
+      color: "#ffffff",
+      fontSize: "13px",
+      fontFamily: "system-ui, -apple-system, sans-serif",
+      lineHeight: "1.4",
+      boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
+      display: "flex",
+      flexDirection: "column",
+      gap: "10px"
+    });
+
+    const title = doc.createElement("div");
+    title.textContent = "Name this page template:";
+    box.appendChild(title);
+
+    const input = doc.createElement("input");
+    input.type = "text";
+    Object.assign(input.style, {
+      width: "100%",
+      boxSizing: "border-box",
+      padding: "8px",
+      borderRadius: "4px",
+      border: "1px solid rgba(255, 255, 255, 0.4)",
+      background: "rgba(0, 0, 0, 0.2)",
+      color: "#ffffff",
+      fontSize: "13px",
+      fontFamily: "inherit",
+      marginTop: "8px"
+    });
+    box.appendChild(input);
+
+    const row = doc.createElement("div");
+    Object.assign(row.style, {
+      display: "flex",
+      justifyContent: "flex-end",
+      gap: "8px",
+      marginTop: "4px"
+    });
+
+    const saveBtn = doc.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save";
+    Object.assign(saveBtn.style, {
+      padding: "4px 16px",
+      borderRadius: "999px",
+      border: "none",
+      background: "#ffffff",
+      color: "#1f2937",
+      fontSize: "12px",
+      fontFamily: "inherit",
+      cursor: "pointer"
+    });
+    saveBtn.addEventListener("click", () => {
+      const name = String(input.value || "").trim();
+      if (!name) {
+        // An empty name is a mistake, not a cancel — keep the dialog open.
+        input.focus();
+        return;
+      }
+      removeTemplatePrompt();
+      onConfirm(name);
+    });
+    row.appendChild(saveBtn);
+
+    const cancelBtn = doc.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    Object.assign(cancelBtn.style, {
+      padding: "4px 16px",
+      borderRadius: "999px",
+      border: "1px solid rgba(255, 255, 255, 0.5)",
+      background: "transparent",
+      color: "#ffffff",
+      fontSize: "12px",
+      fontFamily: "inherit",
+      cursor: "pointer"
+    });
+    cancelBtn.addEventListener("click", () => {
+      removeTemplatePrompt();
+      if (onCancel) onCancel();
+    });
+    row.appendChild(cancelBtn);
+
+    box.appendChild(row);
+    overlay.appendChild(box);
+
+    // Enter saves, Escape cancels — bound on the overlay so the handlers die
+    // with it (the input is focused, so its keydown bubbles here).
+    overlay.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveBtn.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelBtn.click();
+      }
+    });
+    // Backdrop click cancels; clicks inside the box never reach the overlay.
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) cancelBtn.click();
+    });
+
+    (doc.body || doc.documentElement).appendChild(overlay);
+    templatePromptEl = overlay;
+    input.focus();
+  }
+
+  function removeTemplatePrompt() {
+    if (templatePromptEl && templatePromptEl.parentNode) {
+      templatePromptEl.parentNode.removeChild(templatePromptEl);
+    }
+    templatePromptEl = null;
+  }
+
 // Fill this document and all reachable same-origin iframes, summing results.
 // "Unmatched" counts profile entries that matched no field anywhere, so the
 // per-document tallies are merged (a wrapper page with no fields must not
 // report every profile entry as unmatched).
 function fillPageAll(activeProfile, force) {
     const totals = { filled: 0, skipped: 0, unmatched: 0, docs: 0, skippedNames: [] };
-    let matched = 0;
+    const allMatchedKeys = new Set();
     forEachSameOriginDoc(
       (doc) => {
         totals.docs++;
@@ -1534,7 +1899,10 @@ function fillPageAll(activeProfile, force) {
         totals.filled += r.filled;
         totals.skipped += r.skipped;
         if (Array.isArray(r.skippedNames)) totals.skippedNames.push(...r.skippedNames);
-        matched += r.matched;
+        if (Array.isArray(r.matchedKeys)) for (const key of r.matchedKeys) allMatchedKeys.add(key);
+        // A template match replaces the whole page's fill — surface it to the
+        // caller (the background toasts "Filled from template: X").
+        if (r.templateUsed) totals.templateUsed = r.templateUsed;
       },
       undefined,
       force
@@ -1543,7 +1911,9 @@ function fillPageAll(activeProfile, force) {
     const fields =
       profile.fields && typeof profile.fields === "object" ? profile.fields : {};
     const totalEntries = buildMatchEntries(fields).length;
-    totals.unmatched = Math.max(0, totalEntries - matched);
+    totals.matchedKeys = Array.from(allMatchedKeys);
+    totals.totalEntries = totalEntries;
+    totals.unmatched = Math.max(0, totalEntries - allMatchedKeys.size);
     return totals;
   }
 
@@ -1560,6 +1930,19 @@ function fillPageAll(activeProfile, force) {
   // the current hostname is whitelisted.
 
   const STORAGE_KEY = "jobAppToolkit";
+  // Wrong-autofill correction: global exclusions live in browser.storage.local
+  // (the sync quota is a hard 100 KiB and not raisable), keyed by a signature
+  // string, each record { profileKey, fieldNorms, ts }.
+  const EXCLUSIONS_LOCAL = "jtk-form-filler-exclusions";
+  const CLEAR_TIMEOUT_MS = 8000;
+  const UNDO_TTL_MS = 60000;
+  // Page templates also live in browser.storage.local: key
+  // "jtk-form-filler-templates" → { "<id>": { name, shape, fields, savedUrl,
+  // createdAt } }.
+  const TEMPLATES_LOCAL = "jtk-form-filler-templates";
+  // Profiles are offloaded from storage.sync to storage.local (unlimited)
+  // to stay under the 100 KiB sync quota.
+  const PROFILES_LOCAL = "jtk-form-filler-profiles";
   const STYLE_ID = "jtk-form-filler-styles";
   const BTN_WRAPPER_CLASS = "jtk-ff-btns";
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -1577,6 +1960,48 @@ function fillPageAll(activeProfile, force) {
 
   let config = { whitelist: [], profileFields: {}, debug: false };
 
+  // Wrong-autofill correction state: profileKey -> array of fieldNorms arrays
+  // that must never be autofilled again (a GLOBAL exclusion, persisted in
+  // browser.storage.local). Loaded alongside config; a failure leaves an empty
+  // map so the feature degrades to "no exclusions" rather than throwing.
+  let exclusionsByKey = new Map(); // profileKey -> Array<Array<string>> (fieldNorms)
+
+  async function reloadExclusions() {
+    try {
+      const res = await browser.storage.local.get(EXCLUSIONS_LOCAL);
+      const map = res && res[EXCLUSIONS_LOCAL];
+      exclusionsByKey = new Map();
+      if (map && typeof map === "object") {
+        for (const sig of Object.keys(map)) {
+          const rec = map[sig];
+          if (!rec || typeof rec.profileKey !== "string" || !Array.isArray(rec.fieldNorms)) continue;
+          const norms = rec.fieldNorms.filter((n) => typeof n === "string" && n !== "");
+          if (!norms.length) continue;
+          const list = exclusionsByKey.get(rec.profileKey);
+          if (list) list.push(norms); else exclusionsByKey.set(rec.profileKey, [norms]);
+        }
+      }
+    } catch (err) {
+      exclusionsByKey = new Map();
+    }
+  }
+
+  // True when a stored exclusion's fieldNorms intersect the group's current
+  // candidate set — the same identity space matching uses, so an exclusion
+  // recorded against one identity (title, name, label, ...) blocks every
+  // identity that would have matched the same profile entry.
+  function isExcluded(profileKey, group) {
+    const list = exclusionsByKey.get(profileKey);
+    if (!list || list.length === 0) return false;
+    const cands = groupCandidates(group);
+    for (const norms of list) {
+      for (const n of norms) {
+        if (cands.indexOf(n) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
   async function loadConfig() {
     try {
       const res = await browser.storage.sync.get(STORAGE_KEY);
@@ -1585,7 +2010,18 @@ function fillPageAll(activeProfile, force) {
       let whitelist = [];
       if (mod && Array.isArray(mod.whitelist)) whitelist = mod.whitelist;
       let profileFields = {};
-      const active = mod && mod.profiles && mod.profiles[mod.activeProfile];
+      const activeProfile = mod && mod.activeProfile;
+      // Profiles live in storage.local (offloaded from sync to avoid the
+      // 100 KiB quota). Fall back to the sync copy for pre-migration data.
+      let profiles = {};
+      try {
+        const localRes = await browser.storage.local.get(PROFILES_LOCAL);
+        profiles = localRes[PROFILES_LOCAL] || {};
+      } catch (e) { /* ignore */ }
+      if ((!profiles || Object.keys(profiles).length === 0) && mod && mod.profiles) {
+        profiles = mod.profiles;
+      }
+      const active = activeProfile && profiles[activeProfile];
       if (active && active.fields && typeof active.fields === "object") {
         profileFields = active.fields;
       }
@@ -1594,6 +2030,8 @@ function fillPageAll(activeProfile, force) {
         profileFields: profileFields,
         debug: mod && mod.debug === true
       };
+      await reloadExclusions();
+      await reloadTemplates();
     } catch (err) {
       config = { whitelist: [], profileFields: {}, debug: false };
     }
@@ -1703,7 +2141,9 @@ function fillPageAll(activeProfile, force) {
   function findProfileMatch(group) {
     const entries = buildMatchEntries(config.profileFields);
     const matches = matchFields(entries, [
-      { el: group.anchor, candidates: groupCandidates(group) }
+      // The first input, not the anchor: a multiChoice anchor is the question
+      // title element, which would defeat the type-compatibility check.
+      { el: group.inputs[0], candidates: groupCandidates(group) }
     ]);
     return matches.length > 0 ? matches[0] : null;
   }
@@ -1725,6 +2165,55 @@ function fillPageAll(activeProfile, force) {
       for (const c of getCandidates(el, doc)) add(c);
     }
     return cands;
+  }
+
+  // Context-menu "Autofill this field once": fill the single right-clicked
+  // question group from the profile, unconditionally, exactly like the in-page
+  // up-arrow button (unlike fill-page, which never overwrites existing data).
+  // The profile fields come from the background so the click always sees the
+  // active profile. No whitelist interaction here — that is the background's
+  // call, and it deliberately skips it for this action. Returns
+  // { ok, key, label } on success or { ok: false, error } when the field is
+  // gone, the question is unrecognized, or nothing matches.
+  function fillFieldOnceAction(profileFields, targetElementId) {
+    const el = resolveFieldElement(targetElementId);
+    if (!el) {
+      return { ok: false, error: "No fillable field at the right-clicked element." };
+    }
+    const root = el.ownerDocument || document;
+    const groups = discoverGroups(root);
+    let group = null;
+    for (const g of groups) {
+      if (g.inputs.indexOf(el) !== -1) {
+        group = g;
+        break;
+      }
+    }
+    if (!group) {
+      return { ok: false, error: "Could not identify the question for this field." };
+    }
+    const entries = buildMatchEntries(profileFields || {});
+    const matches = matchFields(entries, [
+      // The first input, not the anchor: a multiChoice anchor is the question
+      // title element, which would defeat the type-compatibility check.
+      { el: group.inputs[0], candidates: groupCandidates(group) }
+    ]);
+    if (!matches.length) {
+      const display =
+        group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+      return { ok: false, error: 'No saved value matches "' + display + '".' };
+    }
+    if (isExcluded(matches[0].key, group)) {
+      const display =
+        group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+      return { ok: false, error: 'Skipped — "' + display + '" was marked as incorrect.' };
+    }
+    // Unconditional override, same as the in-page up-arrow button.
+    fillGroup(group, matches[0].entry.value);
+    showClearButton(group);
+    const label =
+      group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+    return { ok: true, key: matches[0].key, label: label };
   }
 
   // Build an inline SVG icon in the host document. Must use createElementNS —
@@ -1804,6 +2293,21 @@ function fillPageAll(activeProfile, force) {
       !Array.isArray(desc.value) &&
       (desc.value === "" || desc.value === null || desc.value === undefined);
     if (isEmptyScalar) {
+      // Diagnostic: log the exact state so we can diagnose why select values
+      // appear empty. Only when debug is on to avoid breaking test harnesses.
+      if (config && config.debug) {
+        console.log(
+          "[Form Filler] onAddClick empty scalar diag:",
+          "kind=" + group.kind,
+          "tag=" + (group.inputs[0] ? group.inputs[0].tagName : "?"),
+          "value=" + JSON.stringify(desc.value),
+          "name=" + JSON.stringify(desc.name),
+          "el.value=" + (group.inputs[0] && group.inputs[0].value != null ? JSON.stringify(group.inputs[0].value) : "?"),
+          "el.type=" + (group.inputs[0] ? group.inputs[0].type : "?"),
+          "selectedIndex=" + (group.inputs[0] && group.inputs[0].selectedIndex != null ? group.inputs[0].selectedIndex : "?"),
+          "options.length=" + (group.inputs[0] && group.inputs[0].options ? group.inputs[0].options.length : "?")
+        );
+      }
       toast('Field "' + display + '" is empty. Enter a value first.');
       return;
     }
@@ -1832,6 +2336,14 @@ function fillPageAll(activeProfile, force) {
       group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
     const match = findProfileMatch(group);
     const entry = buttonMap.get(group.anchor);
+    if (match && isExcluded(match.key, group)) {
+      toast('Skipped — "' + display + '" was marked as incorrect.');
+      if (entry) {
+        entry.fillBtn.classList.add("jtk-ff-dim");
+        entry.fillBtn.title = "Skipped (marked incorrect)";
+      }
+      return;
+    }
     if (!match) {
       toast('No saved value matches "' + display + '".');
       if (entry) entry.fillBtn.classList.add("jtk-ff-dim");
@@ -1841,6 +2353,7 @@ function fillPageAll(activeProfile, force) {
     // fill is an explicit override, unlike fill-page. No toast on success —
     // the visible value change is the feedback.
     fillGroup(group, match.entry.value);
+    showClearButton(group);
     if (entry) {
       entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
       entry.fillBtn.classList.remove("jtk-ff-dim");
@@ -1857,7 +2370,10 @@ function fillPageAll(activeProfile, force) {
   // naming the matched profile key); the add button never changes.
   function updateButtonState(entry, group) {
     const match = findProfileMatch(group);
-    if (match) {
+    if (match && isExcluded(match.key, group)) {
+      entry.fillBtn.classList.add("jtk-ff-dim");
+      entry.fillBtn.title = "Skipped (marked incorrect)";
+    } else if (match) {
       entry.fillBtn.classList.remove("jtk-ff-dim");
       entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
     } else {
@@ -1917,6 +2433,212 @@ function fillPageAll(activeProfile, force) {
       if (parent) parent.insertBefore(entry.wrapper, first.nextSibling);
     }
     positionButtons(entry, group);
+  }
+
+  // ------------------------------------------------------------------
+  // Wrong-autofill correction: transient × button
+  // ------------------------------------------------------------------
+  //
+  // After a successful autofill a small × appears beside the field. Clicking
+  // it clears the group and records a GLOBAL exclusion for the profile-entry ↔
+  // field pairing so all future autofills skip it (persisted in
+  // browser.storage.local via the background). An Undo toast restores the
+  // value and removes the exclusion. This is a standalone overlay — NOT gated
+  // by the whitelist, and never rendered for AI answers (exclusions only apply
+  // to profile-entry-based fills).
+
+  let clearButtons = new Map(); // group.anchor -> { wrapper, timer, inputCleanups }
+  let undoBuffer = new Map(); // compositeKey -> { group, value, ts }
+
+  function compositeKey(profileKey, fieldNorms) {
+    return profileKey + "\u0000" + fieldNorms.slice().sort().join("\u0001");
+  }
+
+  function showClearButton(group) {
+    if (!group || !group.inputs || !group.inputs.length) return;
+    removeClearButton(group);
+    const doc = group.inputs[0].ownerDocument || document;
+    const wrapper = doc.createElement("span");
+    wrapper.className = BTN_WRAPPER_CLASS;
+
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "jtk-ff-btn jtk-ff-clear";
+    // × icon: two crossing strokes. The existing icons are fill-based; this
+    // one is stroke-based, so the stroke attributes go on the svg element.
+    const icon = createIcon(doc, [["path", { d: "M2 2l8 8M10 2L2 10" }]]);
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "1.5");
+    btn.appendChild(icon);
+    btn.title = "Clear and don't autofill this field again";
+    btn.setAttribute("aria-label", "Clear and don't autofill this field again");
+    btn.addEventListener("click", (e) => onClearClick(e, group));
+    wrapper.appendChild(btn);
+
+    const titleEl = group.titleEl;
+    if (titleEl && titleEl.parentNode) {
+      titleEl.parentNode.insertBefore(wrapper, titleEl.nextSibling);
+    } else {
+      const first = group.inputs[0];
+      const parent = first.parentNode;
+      if (parent) parent.insertBefore(wrapper, first.nextSibling);
+    }
+
+    // Same negative-top centering as the button pair (positionButtons).
+    const target = group.titleEl || group.inputs[0];
+    const measured = target.getBoundingClientRect().height;
+    const fieldH = measured > 0 ? measured : 40;
+    let marginBottom = 0;
+    const view = target.ownerDocument ? target.ownerDocument.defaultView : null;
+    if (view && typeof view.getComputedStyle === "function") {
+      const mb = parseFloat(view.getComputedStyle(target).marginBottom);
+      if (isFinite(mb) && mb > 0) marginBottom = Math.min(mb, 40);
+    }
+    wrapper.style.top = -Math.round(fieldH / 2 + marginBottom) + "px";
+
+    // Auto-remove: a timeout, plus one-shot input/change listeners on every
+    // member field (the user editing the field makes the correction moot).
+    const inputCleanups = [];
+    const timer = setTimeout(() => removeClearButton(group), CLEAR_TIMEOUT_MS);
+    for (const el of group.inputs) {
+      const onEdit = () => removeClearButton(group);
+      el.addEventListener("input", onEdit, true);
+      el.addEventListener("change", onEdit, true);
+      inputCleanups.push(() => {
+        el.removeEventListener("input", onEdit, true);
+        el.removeEventListener("change", onEdit, true);
+      });
+    }
+    clearButtons.set(group.anchor, {
+      wrapper: wrapper,
+      timer: timer,
+      inputCleanups: inputCleanups
+    });
+  }
+
+  function removeClearButton(group) {
+    const entry = clearButtons.get(group.anchor);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    for (const cleanup of entry.inputCleanups) {
+      try {
+        cleanup();
+      } catch (err) {
+        // Ignore.
+      }
+    }
+    if (entry.wrapper && entry.wrapper.parentNode) entry.wrapper.remove();
+    clearButtons.delete(group.anchor);
+  }
+
+  function onClearClick(e, group) {
+    e.preventDefault();
+    e.stopPropagation();
+    const match = findProfileMatch(group);
+    if (!match) {
+      removeClearButton(group);
+      return;
+    }
+    const value = match.entry.value;
+    clearGroup(group);
+    const fieldNorms = groupCandidates(group);
+    // Prune stale undo entries while we're here.
+    const now = Date.now();
+    for (const [key, entry] of undoBuffer) {
+      if (now - entry.ts > UNDO_TTL_MS) undoBuffer.delete(key);
+    }
+    undoBuffer.set(compositeKey(match.key, fieldNorms), {
+      group: group,
+      value: value,
+      ts: now
+    });
+    // Fire-and-forget: the background persists the exclusion in storage.local.
+    browser.runtime
+      .sendMessage({
+        type: "form-filler:addExclusion",
+        profileKey: match.key,
+        fieldNorms: fieldNorms
+      })
+      .catch(() => {});
+    const msg = 'Cleared — won\'t autofill "' + match.key + '" here again.';
+    try {
+      if (typeof window.jobAppToolkit.content.showToast === "function") {
+        // The toast action button sends { type: action.type, ...action.payload }
+        // to the background, so the payload carries exactly profileKey +
+        // fieldNorms for the undo round-trip.
+        window.jobAppToolkit.content.showToast(msg, {
+          type: "form-filler:undoExclusion",
+          label: "Undo",
+          payload: { profileKey: match.key, fieldNorms: fieldNorms }
+        });
+      } else {
+        toast(msg);
+      }
+    } catch (err) {
+      toast(msg);
+    }
+    removeClearButton(group);
+  }
+
+  // Empty a question group (the inverse of fillGroup): radios uncheck, multi
+  // selects deselect every option, checkboxes uncheck, singles clear to "".
+  // Every changed control dispatches the same user-like events fillGroup uses.
+  function clearGroup(group) {
+    if (!group || !group.inputs || !group.inputs.length) return;
+    if (group.kind === "radio") {
+      for (const el of group.inputs) {
+        if (el.checked) {
+          el.checked = false;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      return;
+    }
+    if (group.kind === "multiChoice") {
+      for (const el of group.inputs) {
+        if (el.tagName === "SELECT") {
+          let changed = false;
+          for (const opt of el.options) {
+            if (opt.selected) {
+              opt.selected = false;
+              changed = true;
+            }
+          }
+          if (changed) el.dispatchEvent(new Event("change", { bubbles: true }));
+        } else if (el.type === "checkbox") {
+          if (el.checked) {
+            el.checked = false;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+      }
+      return;
+    }
+    // Single: clear to "" via the native setter (fillField skips nothing for
+    // empty strings, but setNativeValue is the exact same path fillField uses
+    // for text inputs and dispatches both events).
+    const el = group.inputs[0];
+    if (el && el.value !== "") {
+      setNativeValue(el, "");
+    }
+  }
+
+  // Undo a wrong-autofill correction: restore the cleared value and drop the
+  // exclusion (the background removes the stored record). No-op when the undo
+  // buffer has no entry (expired, or the message arrived without a click).
+  function handleUndoExclusion(message) {
+    const key = compositeKey(message.profileKey, message.fieldNorms);
+    const entry = undoBuffer.get(key);
+    if (entry && entry.group && entry.group.inputs[0] && entry.group.inputs[0].isConnected) {
+      fillGroup(entry.group, entry.value);
+      undoBuffer.delete(key);
+      toast('Undid — this field can autofill again.');
+      const btnEntry = buttonMap.get(entry.group.anchor);
+      if (btnEntry) updateButtonState(btnEntry, entry.group);
+    }
+    return { ok: true };
   }
 
   // ------------------------------------------------------------------
@@ -2027,6 +2749,70 @@ function fillPageAll(activeProfile, force) {
     const m = cut.match(/\s+\S*$/);
     if (m && m.index > 0) cut = cut.slice(0, m.index);
     return cut.trim();
+  }
+
+  // MyGreenhouse gate + extraction for Ask AI. The "Quick Apply with
+  // MyGreenhouse" wrapper is server-rendered beside the application form (the
+  // button text is injected client-side, so match the class, not the text) —
+  // detection therefore works on any company domain and inside the embedded
+  // application iframe. Also derives the Greenhouse org + job id for the
+  // background API fallback: from this frame's URL when it is a Greenhouse
+  // board, else from the embed script (?for=<org>) and a data-job-id element.
+  // `isGreenhouse` is the button gate; org/jobId are still reported when the
+  // gate is false so the background can join them across frames (the gate
+  // lives in the application iframe, the job id on the company page).
+  function greenhouseProbe(root) {
+    const doc = root || document;
+    let org = "";
+    let jobId = "";
+    try {
+      const loc = new URL(doc.location ? doc.location.href : "");
+      if (/greenhouse\.io$/.test(loc.hostname)) {
+        const parts = loc.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+        if (parts[0] === "embed") {
+          org = loc.searchParams.get("for") || "";
+        } else if (parts.length >= 2 && parts[0] !== "jobs") {
+          org = parts[0];
+          jobId = parts[parts.length - 1];
+        }
+      }
+    } catch (err) {
+      // Ignore.
+    }
+    if (!org) {
+      const emb = doc.querySelector(
+        'script[src*="greenhouse.io/embed/job_board"][src*="for="]'
+      );
+      if (emb) {
+        try {
+          org = new URL(
+            emb.getAttribute("src"),
+            doc.location ? doc.location.href : undefined
+          ).searchParams.get("for") || "";
+        } catch (err) {
+          // Ignore.
+        }
+      }
+    }
+    if (!jobId) {
+      const jidEl = doc.querySelector("[data-job-id]");
+      if (jidEl) jobId = String(jidEl.getAttribute("data-job-id") || "");
+    }
+    const empty = { isGreenhouse: false, org: org, jobId: jobId, title: "", description: "" };
+    const gate = doc.querySelector(".application--header--autofill-with-greenhouse");
+    if (!gate) return empty;
+    let title = "";
+    const h1 = doc.querySelector(".job__title h1");
+    if (h1) {
+      title = collapseWs(h1.textContent);
+    } else {
+      const og = doc.querySelector('meta[property="og:title"]');
+      if (og) title = collapseWs(og.getAttribute("content"));
+    }
+    let description = "";
+    const descNode = doc.querySelector(".job__description");
+    if (descNode) description = truncateJobDescriptionText(collapseWs(descNode.textContent || ""));
+    return { isGreenhouse: true, org: org, jobId: jobId, title: title, description: description };
   }
 
   // JobPosting JSON-LD -> { title, description } for Ask AI. Description may
@@ -2230,6 +3016,7 @@ function fillPageAll(activeProfile, force) {
   }
 
   function teardown() {
+    removeAlreadyAppliedWarning();
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -2263,6 +3050,23 @@ function fillPageAll(activeProfile, force) {
     }
     submitMonitors.clear();
     buttonMap = new WeakMap();
+    // Wrong-autofill correction: drop every transient × button and the undo
+    // buffer (the exclusions themselves persist in storage.local).
+    for (const group of clearButtons.keys()) {
+      try {
+        removeClearButton(group);
+      } catch (err) {
+        // Ignore.
+      }
+    }
+    clearButtons.clear();
+    undoBuffer.clear();
+    // Page templates: drop the in-memory copy (the persisted store is
+    // untouched). Preserve an open naming dialog — the user triggered it
+    // deliberately and should not lose it to a background scan or module
+    // toggle. It is removed only by explicit Save/Cancel or a fresh
+    // showTemplatePrompt call.
+    savedTemplates = [];
   }
 
   let observer = null;
@@ -2302,9 +3106,115 @@ function fillPageAll(activeProfile, force) {
       teardown();
       return;
     }
+    checkAlreadyApplied();
     await loadConfig();
     startObserving();
     scanPage();
+  }
+
+  // This is deliberately a top-frame, one-shot check.  The warning is an
+  // alert rather than a toast because it is important context for the whole
+  // application page, but it must remain passive so it cannot interrupt form
+  // entry or steal focus.
+  let alreadyAppliedChecked = false;
+  let alreadyAppliedWarningEl = null;
+  let alreadyAppliedWarningTimer = null;
+  function checkAlreadyApplied() {
+    if (alreadyAppliedChecked || window.top !== window) return;
+    alreadyAppliedChecked = true;
+    try {
+      const request = browser.runtime.sendMessage({
+        type: "form-filler:hasAppliedToCurrentUrl",
+        url: location.href
+      });
+      Promise.resolve(request).then((result) => {
+        if (
+          result &&
+          result.alreadyApplied === true &&
+          window.jobAppToolkit.content.isModuleActive(MODULE_ID)
+        ) {
+          showAlreadyAppliedWarning();
+        }
+      }).catch(() => {});
+    } catch (err) {
+      // Runtime messaging can be unavailable while a temporary add-on reloads.
+    }
+  }
+
+  function removeAlreadyAppliedWarning() {
+    if (alreadyAppliedWarningTimer) {
+      clearTimeout(alreadyAppliedWarningTimer);
+      alreadyAppliedWarningTimer = null;
+    }
+    if (alreadyAppliedWarningEl && alreadyAppliedWarningEl.parentNode) {
+      alreadyAppliedWarningEl.parentNode.removeChild(alreadyAppliedWarningEl);
+    }
+    alreadyAppliedWarningEl = null;
+  }
+
+  function showAlreadyAppliedWarning() {
+    if (alreadyAppliedWarningEl || document.querySelector(".jtk-ff-applied-warning")) return;
+    const alert = document.createElement("div");
+    alert.className = "jtk-ff-applied-warning";
+    alert.setAttribute("role", "alert");
+    alert.setAttribute("aria-live", "assertive");
+    alert.setAttribute("aria-atomic", "true");
+    Object.assign(alert.style, {
+      position: "fixed",
+      top: "16px",
+      left: "16px",
+      zIndex: "2147483647",
+      width: "min(360px, calc(100vw - 32px))",
+      boxSizing: "border-box",
+      display: "flex",
+      alignItems: "flex-start",
+      gap: "10px",
+      padding: "14px 16px",
+      border: "2px solid #7f1d1d",
+      borderRadius: "10px",
+      background: "#dc2626",
+      color: "#ffffff",
+      font: "600 14px/1.4 system-ui, -apple-system, sans-serif",
+      textAlign: "left",
+      boxShadow: "0 8px 24px rgba(0, 0, 0, 0.35)",
+      pointerEvents: "none",
+      opacity: "1"
+    });
+    for (const name of ["width", "box-sizing", "display", "padding", "border", "border-radius", "background", "color", "font", "text-align", "box-shadow", "pointer-events", "opacity", "position", "top", "left", "z-index"]) {
+      alert.style.setProperty(name, alert.style.getPropertyValue(name), "important");
+    }
+
+    const mark = document.createElement("span");
+    mark.textContent = "!";
+    mark.setAttribute("aria-hidden", "true");
+    Object.assign(mark.style, {
+      flex: "none",
+      width: "22px",
+      height: "22px",
+      borderRadius: "50%",
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "#ffffff",
+      color: "#b91c1c",
+      font: "800 16px/1 system-ui, sans-serif"
+    });
+    for (const name of ["flex", "width", "height", "border-radius", "display", "align-items", "justify-content", "background", "color", "font"]) {
+      mark.style.setProperty(name, mark.style.getPropertyValue(name), "important");
+    }
+    const copy = document.createElement("span");
+    copy.textContent = "You already applied to this job.";
+    copy.style.setProperty("color", "#ffffff", "important");
+    copy.style.setProperty("font", "600 14px/1.4 system-ui, -apple-system, sans-serif", "important");
+    alert.appendChild(mark);
+    alert.appendChild(copy);
+    (document.body || document.documentElement).appendChild(alert);
+    alreadyAppliedWarningEl = alert;
+    alreadyAppliedWarningTimer = setTimeout(() => {
+      if (alert.parentNode) alert.parentNode.removeChild(alert);
+      if (alreadyAppliedWarningEl === alert) alreadyAppliedWarningEl = null;
+      alreadyAppliedWarningTimer = null;
+    }, 3000);
   }
 
   // ------------------------------------------------------------------
@@ -2338,6 +3248,13 @@ function fillPageAll(activeProfile, force) {
   let spinnerLastTick = 0;    // clock of the last loop tick, for the rAF guard
   let spinnerPlaced = false;  // false until the first position is set
   let spinnerShownAt = 0;     // clock value when the ring appeared, for the max-age watchdog
+
+  // Snapshot of the field each AI flow started from, keyed by flowId. The
+  // right-click capture (getAIFieldInfo) resolves the element while the menu
+  // is alive; later fill/spinner/error messages for the same flow may arrive
+  // after browser.menus.getTargetElement's weak reference to that element has
+  // died, so we cache the resolved element here and fall back to it.
+  const aiFieldCache = new Map();
 
   // Spinner CSS is its own <style> — not the button stylesheet — because the
   // AI flow also runs on non-whitelisted pages where the button styles are
@@ -2457,14 +3374,120 @@ function fillPageAll(activeProfile, force) {
     spinnerShownAt = 0;
   }
 
-  function handleAiSpinner(show, targetElementId) {
+  function handleAiSpinner(show, targetElementId, flowId) {
     if (!show) {
       hideAiSpinner();
       return { ok: true };
     }
-    const el = resolveFieldElement(targetElementId);
+    const el = resolveAiField(targetElementId, flowId);
     if (!el) return { ok: false };
     showAiSpinner(el);
+    return { ok: true };
+  }
+
+  // ------------------------------------------------------------------
+  // AI error icon (red ! replacing the spinner on failure)
+  // ------------------------------------------------------------------
+  //
+  // When the AI answer fails (API error, timeout, fill rejected), the
+  // background sends form-filler:aiError. The content script replaces the
+  // spinner with a red "!" icon at the same position. The icon persists
+  // until the field's focus state changes (blur→focus or focus→blur), at
+  // which point it is removed. Hovering shows the error via title.
+
+  let aiErrorEl = null;       // the visible ! icon, if any
+  let aiErrorField = null;    // the field the icon tracks
+  let aiErrorFocusCleaner = null; // { blur, focus } — the listeners we attached
+
+  const AI_ERROR_CLASS = "jtk-ff-ai-error";
+
+  function injectAiErrorStyles(doc) {
+    const root = doc || document;
+    if (root.getElementById(SPINNER_STYLE_ID)) return;
+    // Reuse the same style id — only one of spinner/error is ever visible.
+    const style = root.createElement("style");
+    style.id = SPINNER_STYLE_ID;
+    style.textContent =
+      // The red ! icon: same positioning as the spinner (fixed, top-left
+      // of the field +6px). Small red circle with white !, pointer-events
+      // none so it never blocks input.
+      ".jtk-ff-ai-error{position:fixed;width:14px;height:14px;box-sizing:border-box;" +
+      "border-radius:50%;background:#dc2626;color:#fff;font-size:10px;line-height:14px;" +
+      "text-align:center;font-weight:700;pointer-events:none;z-index:2147483000;}";
+    (root.head || root.documentElement).appendChild(style);
+  }
+
+  function positionAiError() {
+    if (!aiErrorEl || !aiErrorField) return;
+    try {
+      if (!aiErrorField.isConnected) return;
+      const rect = aiErrorField.getBoundingClientRect();
+      const view = aiErrorEl.ownerDocument.defaultView || window;
+      const vw = view.innerWidth || 0;
+      const vh = view.innerHeight || 0;
+      const onScreen =
+        (vw <= 0 || (rect.left < vw && rect.right > 0)) &&
+        (vh <= 0 || (rect.top < vh && rect.bottom > 0));
+      if (!onScreen) return;
+      aiErrorEl.style.left = Math.round(rect.left + 6) + "px";
+      aiErrorEl.style.top = Math.round(rect.top + 6) + "px";
+    } catch (err) {
+      // Never fatal.
+    }
+  }
+
+  function showAiError(el, errorMsg) {
+    hideAiError();
+    hideAiSpinner(); // clear any leftover spinner first
+    const doc = el.ownerDocument || document;
+    injectAiErrorStyles(doc);
+    const holder = doc.body || doc.documentElement;
+    if (!holder) return;
+    aiErrorEl = doc.createElement("div");
+    aiErrorEl.className = AI_ERROR_CLASS;
+    aiErrorEl.setAttribute("aria-hidden", "true");
+    aiErrorEl.title = errorMsg || "AI answer failed";
+    aiErrorEl.textContent = "!";
+    holder.appendChild(aiErrorEl);
+    aiErrorField = el;
+    positionAiError();
+    // Re-position on scroll/resize so the icon stays near the field.
+    const view = doc.defaultView || window;
+    view.addEventListener("scroll", positionAiError, true);
+    view.addEventListener("resize", positionAiError, true);
+    // Attach focus/blur listener to the field: any focus-state change
+    // removes the error icon. Use capture phase so we catch events even
+    // when the field is in a shadow DOM or deeply nested.
+    const onBlur = function () { hideAiError(); };
+    const onFocus = function () { hideAiError(); };
+    aiErrorFocusCleaner = { blur: onBlur, focus: onFocus };
+    el.addEventListener("blur", onBlur, true);
+    el.addEventListener("focus", onFocus, true);
+  }
+
+  function hideAiError() {
+    if (aiErrorFocusCleaner && aiErrorField) {
+      aiErrorField.removeEventListener("blur", aiErrorFocusCleaner.blur, true);
+      aiErrorField.removeEventListener("focus", aiErrorFocusCleaner.focus, true);
+      aiErrorFocusCleaner = null;
+    }
+    if (aiErrorEl) {
+      const doc = aiErrorEl.ownerDocument;
+      const view = doc.defaultView || window;
+      view.removeEventListener("scroll", positionAiError, true);
+      view.removeEventListener("resize", positionAiError, true);
+      if (aiErrorEl.parentNode) aiErrorEl.parentNode.removeChild(aiErrorEl);
+      const style = doc.getElementById(SPINNER_STYLE_ID);
+      if (style) style.remove();
+      aiErrorEl = null;
+    }
+    aiErrorField = null;
+  }
+
+  function handleAiError(targetElementId, errorMsg, flowId) {
+    const el = resolveAiField(targetElementId, flowId);
+    if (!el) { hideAiError(); return { ok: true }; }
+    showAiError(el, errorMsg);
     return { ok: true };
   }
 
@@ -2474,8 +3497,17 @@ function fillPageAll(activeProfile, force) {
 
   try {
     browser.storage.onChanged.addListener((changes, area) => {
-      if (area !== "sync" || !changes[STORAGE_KEY]) return;
-      ensureActive();
+      if (area === "sync") {
+        if (changes[STORAGE_KEY]) ensureActive();
+      } else if (area === "local") {
+        // Wrong-autofill correction: reload the exclusion map. buttonMap only
+        // stores entry objects (keyed by group.anchor), so per-entry refresh
+        // is skipped here — the 2s poll re-runs ensureButtons/updateButtonState
+        // for every group anyway, which is the backstop.
+        if (changes[EXCLUSIONS_LOCAL]) reloadExclusions().catch(() => {});
+        // Page templates: pick up saves/deletes made by the background.
+        if (changes[TEMPLATES_LOCAL]) reloadTemplates().catch(() => {});
+      }
     });
   } catch (err) {
     // Never fatal (e.g. harness stubs without storage.onChanged).
@@ -2509,7 +3541,10 @@ function fillPageAll(activeProfile, force) {
     if (message.type === "jtk:moduleActivityChanged") {
       if (message.id === MODULE_ID) {
         if (message.active) ensureActive();
-        else teardown();
+        else {
+          removeTemplatePrompt();
+          teardown();
+        }
       }
       return undefined;
     }
@@ -2528,6 +3563,51 @@ function fillPageAll(activeProfile, force) {
     if (type === "fillPage") {
       return Promise.resolve(fillPageAll(message.activeProfile, message.force === true));
     }
+    if (type === "fillFieldOnce") {
+      return Promise.resolve(
+        fillFieldOnceAction(message.profileFields, message.targetElementId)
+      );
+    }
+    if (type === "undoExclusion") {
+      return Promise.resolve(handleUndoExclusion(message));
+    }
+    if (type === "promptSaveTemplate") {
+      // "Save page template" context-menu action → show the naming dialog,
+      // then capture the current page's shape + per-group values and hand them
+      // to the background for persistence. The dialog is content-side only and
+      // not whitelist-gated (the background gates the menu visibility).
+      showTemplatePrompt(
+        function (name) {
+          const shape = computePageShape(document);
+          const groups = discoverGroups(document);
+          const fields = [];
+          for (let i = 0; i < groups.length; i++) {
+            const g = groups[i];
+            const identity = groupIdentity(g);
+            if (!identity) continue;
+            const desc = describeGroup(g);
+            fields.push({ identity: identity, value: desc.value, fieldLabel: desc.fieldLabel });
+          }
+          browser.runtime
+            .sendMessage({
+              type: "form-filler:saveTemplate",
+              name: name,
+              shape: shape,
+              fields: fields,
+              url: location.href
+            })
+            .then((res) => {
+              if (res && res.error) toast(res.error);
+              else toast('Saved page template "' + name + '".');
+            })
+            .catch(() => {});
+        },
+        function () {
+          // Cancelled — nothing to do.
+        }
+      );
+      return undefined;
+    }
     if (type === "getFocusedField") {
       return Promise.resolve(getFocusedField(message.targetElementId));
     }
@@ -2544,6 +3624,10 @@ function fillPageAll(activeProfile, force) {
           error: "No fillable field at the right-clicked element."
         });
       }
+      // Snapshot the resolved element for the rest of this flow: the menu's
+      // weak reference can die while the AI answer is pending, and the later
+      // fill/spinner/error messages still need the field.
+      if (message.flowId) aiFieldCache.set(message.flowId, el);
       const desc = describeAIField(el);
       aiLog(
         message.flowId,
@@ -2571,6 +3655,29 @@ function fillPageAll(activeProfile, force) {
       return Promise.resolve({ ok: true });
     }
     if (type === "getJobDescription") {
+      // MyGreenhouse button-gated path first: the wrapper is server-rendered
+      // next to the application form, so it works on any company domain and
+      // inside the embedded application iframe. org/jobId are reported on
+      // every response so the background can join them across frames for the
+      // board-API fallback.
+      const gh = greenhouseProbe(document);
+      if (gh.isGreenhouse) {
+        aiLog(
+          message.flowId,
+          "job description (MyGreenhouse): " + gh.description.length + " chars" +
+            (gh.title ? ' ("' + gh.title.slice(0, 80) + '")' : "") +
+            (gh.org || gh.jobId ? " [org=" + gh.org + " job=" + gh.jobId + "]" : "")
+        );
+        return Promise.resolve({
+          ok: true,
+          flowId: message.flowId,
+          adapterId: "greenhouse",
+          jobTitle: gh.title,
+          jobDescription: gh.description,
+          org: gh.org,
+          jobId: gh.jobId
+        });
+      }
       // Top-frame Ask AI fast path: JobPosting JSON-LD on the live page
       // (Ashby posts this on both the posting and /application URLs).
       const posting = jobPostingFromJsonLd(document);
@@ -2583,22 +3690,28 @@ function fillPageAll(activeProfile, force) {
         return Promise.resolve({
           ok: true,
           flowId: message.flowId,
+          adapterId: "",
           jobTitle: posting.title,
-          jobDescription: posting.description
+          jobDescription: posting.description,
+          org: gh.org,
+          jobId: gh.jobId
         });
       }
       aiLog(message.flowId, "job description: none on this document");
       return Promise.resolve({
         ok: false,
         flowId: message.flowId,
+        adapterId: "",
         jobTitle: "",
-        jobDescription: ""
+        jobDescription: "",
+        org: gh.org,
+        jobId: gh.jobId
       });
     }
     if (type === "fillAIField") {
       const value = String(message.value == null ? "" : message.value);
-      const el = resolveFieldElement(message.targetElementId);
-      if (!el) {
+      const el = resolveAiField(message.targetElementId, message.flowId);
+      if (!el || !el.isConnected) {
         aiLog(message.flowId, "fill: target " + message.targetElementId + " no longer available");
         return Promise.resolve({
           ok: false,
@@ -2629,7 +3742,14 @@ function fillPageAll(activeProfile, force) {
         message.flowId,
         "spinner " + (message.show !== false ? "show" : "hide") + " target " + message.targetElementId
       );
-      return Promise.resolve(handleAiSpinner(message.show !== false, message.targetElementId));
+      return Promise.resolve(handleAiSpinner(message.show !== false, message.targetElementId, message.flowId));
+    }
+    if (type === "aiError") {
+      // Background signals the AI answer failed: replace the spinner with a
+      // persistent red "!" icon on the target field. The icon is removed
+      // when the field's focus state changes.
+      aiLog(message.flowId, "error icon target " + message.targetElementId + ": " + (message.error || ""));
+      return Promise.resolve(handleAiError(message.targetElementId, message.error, message.flowId));
     }
     return undefined;
   });

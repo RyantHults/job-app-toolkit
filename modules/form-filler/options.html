@@ -82,10 +82,12 @@
       <button type="button" id="ai-instructions-reset" class="btn">Reset to default</button>
     </div>
     <p class="subtitle">Static instructions only — the question, your background, and the field's length limit are added automatically. Blank uses the built-in default.</p>
-    <div class="row">
-      <label for="ai-key" class="label">API key</label>
-      <input type="password" id="ai-key" placeholder="sk-…" aria-label="API key">
-      <button type="button" id="ai-key-clear" class="btn" hidden>Remove key</button>
+    <label class="label">API keys</label>
+    <ul id="ai-key-list" class="key-list"></ul>
+    <div id="ai-key-add" class="key-add">
+      <input type="text" id="ai-key-name" placeholder="Name (e.g. Personal, Work)" aria-label="Key name" class="key-name-input">
+      <input type="password" id="ai-key-value" placeholder="sk-…" aria-label="API key" class="key-value-input">
+      <button type="button" id="ai-key-add-btn" class="btn btn-primary">Add</button>
     </div>
     <p class="subtitle" id="ai-key-status"></p>
     <div class="row">

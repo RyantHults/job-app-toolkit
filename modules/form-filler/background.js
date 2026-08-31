@@ -2,7 +2,7 @@
  * Form Filler — background module. Registers with the Job App Toolkit core and
  * owns:
  *  - popup quick actions ("Fill Page" and "Add Current Field");
- *  - page-level context-menu actions ("Add all fields", "Fill page");
+ *  - top-level context-menu actions ("Add all fields", "Autofill page", "Autofill this field once", "Answer with AI");
  *  - request handlers used by the module options page and the in-page
  *    per-field buttons;
  *  - an auto-grown whitelist of hostnames the user filled from the popup.
@@ -14,15 +14,27 @@
   "use strict";
 
   const MODULE_ID = "form-filler";
+  const COMMANDS = {
+    fillFieldOnce: "form-filler-autofill-field-once"
+  };
+  // The core passes moduleApi() to menu/message handlers. Keep the latest API
+  // when menus are rebuilt, but also provide a small direct-storage fallback:
+  // a persistent:false event page can be recreated for a commands event
+  // without running createContextMenu first.
+  let moduleApiRef = null;
 
-  // Context-menu ids: page-level actions ("add all fields", "fill page") plus
-  // the per-field "Answer with AI" item (targets the right-clicked editable
-  // element); the remaining per-field flows live on the in-page buttons.
+  // Context-menu ids: top-level actions ("autofill page", "autofill this field
+  // once"), the per-field "Answer with AI" item (targets the right-clicked
+  // editable element), plus the "Save fields" submenu whose children are
+  // "Add all fields" and "Save page template"; the remaining per-field flows
+  // live on the in-page buttons.
   const MENU = {
-    root: MODULE_ID + "-menu",
     addAll: MODULE_ID + "-add-all-fields",
     fillPage: MODULE_ID + "-fill-page",
-    aiAnswer: MODULE_ID + "-ai-answer"
+    fillFieldOnce: MODULE_ID + "-fill-field-once",
+    aiAnswer: MODULE_ID + "-ai-answer",
+    saveFields: MODULE_ID + "-save-fields",
+    saveTemplate: MODULE_ID + "-save-template"
   };
 
   // Lowercased hostname without the leading "www." prefix; "" when the URL is
@@ -67,6 +79,36 @@
     return webTabs.find((t) => t.active) || webTabs[0] || null;
   }
 
+  // A commands event does not include a tab. Query the active tab in the last
+  // focused window first, rather than using the core's in-memory last-tab
+  // tracker (which is empty or stale after an event-page wake-up). The other
+  // queries are compatibility fallbacks for browsers/test doubles that do not
+  // support lastFocusedWindow/currentWindow filters.
+  async function getCommandWebTab() {
+    const isWebTab = (tab) =>
+      tab && typeof tab.id === "number" && tab.url && /^https?:/i.test(tab.url);
+    const queries = [
+      { active: true, lastFocusedWindow: true },
+      { active: true, currentWindow: true },
+      { active: true }
+    ];
+    for (const query of queries) {
+      try {
+        const tabs = await browser.tabs.query(query);
+        if (!Array.isArray(tabs)) continue;
+        const webTab = tabs.find(isWebTab);
+        if (webTab) return webTab;
+        // A successful query returning the active non-web tab means there is
+        // no web tab to act on in that focused window; do not fill a random
+        // background tab from another window.
+        if (tabs.length) return null;
+      } catch (err) {
+        // Try the next supported query shape.
+      }
+    }
+    return null;
+  }
+
   // Send a message to the content script of a frame in the target tab. Defaults
   // to the top frame (frameId 0) so popup/options flows behave exactly as
   // before; context-menu flows pass info.frameId so actions land on the frame
@@ -85,12 +127,34 @@
 
   // Frame ids of a tab, main frame first. Job portals (iCIMS, Workday, ...)
   // render their forms in nested iframes, so actions must reach every frame.
-  // Falls back to just the main frame when the frames API is unavailable.
+  // Recent Firefox (FF150+) site-isolates every cross-origin iframe into its
+  // own content process, and tabs.getAllFrames — built on the tab's DocShell
+  // tree — misses those out-of-process frames even though the content script
+  // is injected into them (all_frames). webNavigation.getAllFrames walks the
+  // BrowsingContexts tree in the parent process instead, which sees OOP
+  // frames too; without it (or on error) fall back to tabs.getAllFrames, then
+  // to just the main frame.
   async function frameIdsOf(tab) {
+    try {
+      if (browser.webNavigation && browser.webNavigation.getAllFrames) {
+        const frames = await browser.webNavigation.getAllFrames({ tabId: tab.id });
+        if (frames && frames.length) {
+          return frames
+            .filter((f) => !f.errorOccurred)
+            .map((f) => f.frameId)
+            .sort((a, b) => (a === 0 ? -1 : b === 0 ? 1 : a - b));
+        }
+      }
+    } catch (err) {
+      // Fall through to tabs.getAllFrames.
+    }
     try {
       const frames = await browser.tabs.getAllFrames(tab.id);
       if (frames && frames.length) {
-        return frames.filter((f) => !f.errorOccurred).map((f) => f.frameId);
+        return frames
+          .filter((f) => !f.errorOccurred)
+          .map((f) => f.frameId)
+          .sort((a, b) => (a === 0 ? -1 : b === 0 ? 1 : a - b));
       }
     } catch (err) {
       // Fall through to the main frame only.
@@ -167,6 +231,8 @@
 async function fillPageAcrossFrames(tab, fields) {
     const frameIds = await frameIdsOf(tab);
     const totals = { filled: 0, skipped: 0, unmatched: 0, skippedNames: [] };
+    const matchedKeys = new Set();
+    let totalEntries = 0;
     let anyResponded = false;
     let responded = 0;
 
@@ -178,6 +244,14 @@ async function fillPageAcrossFrames(tab, fields) {
       }
     };
 
+    const absorb = (res) => {
+      totals.filled += res.filled || 0;
+      totals.skipped += res.skipped || 0;
+      totalEntries = Math.max(totalEntries, res.totalEntries || 0);
+      if (Array.isArray(res.matchedKeys)) for (const key of res.matchedKeys) matchedKeys.add(key);
+      if (Array.isArray(res.skippedNames)) totals.skippedNames.push(...res.skippedNames);
+    };
+
     for (const frameId of frameIds) {
       const res = await sendOne(frameId, {
         type: "form-filler:fillPage",
@@ -186,17 +260,14 @@ async function fillPageAcrossFrames(tab, fields) {
       if (!res || typeof res !== "object") continue;
       anyResponded = true;
       responded++;
-      totals.filled += res.filled || 0;
-      totals.skipped += res.skipped || 0;
-      totals.unmatched += res.unmatched || 0;
-      if (Array.isArray(res.skippedNames)) totals.skippedNames.push(...res.skippedNames);
+      absorb(res);
     }
 
     if (
       anyResponded &&
       totals.filled === 0 &&
       totals.skipped === 0 &&
-      totals.unmatched > 0
+      matchedKeys.size === 0
     ) {
       const forced = await sendOne(0, {
         type: "form-filler:fillPage",
@@ -204,12 +275,11 @@ async function fillPageAcrossFrames(tab, fields) {
         force: true
       });
       if (forced && typeof forced === "object") {
-        totals.filled += forced.filled || 0;
-        totals.skipped += forced.skipped || 0;
-        totals.unmatched = forced.unmatched || 0;
-        if (Array.isArray(forced.skippedNames)) totals.skippedNames.push(...forced.skippedNames);
+        absorb(forced);
       }
     }
+
+    totals.unmatched = Math.max(0, totalEntries - matchedKeys.size);
 
     if (anyResponded) {
       console.log(
@@ -237,6 +307,24 @@ async function fillPageAcrossFrames(tab, fields) {
       if (res && typeof res.name === "string" && res.name !== "") return res;
     }
     return null;
+  }
+
+  // Send a no-target field action to each available frame until the frame that
+  // owns DOM focus responds successfully. Each frame resolves the missing
+  // target through its own document.activeElement, which also covers focused
+  // same-origin form iframes without needing script injection or new
+  // permissions. Keep the first response so a useful content-side error can
+  // still be reported when no frame succeeds.
+  async function sendToFocusedContent(tab, message) {
+    const frameIds = await frameIdsOf(tab);
+    let firstResponse = null;
+    for (const frameId of frameIds) {
+      const res = await sendToContent(tab, message, frameId);
+      if (!res) continue;
+      if (!firstResponse) firstResponse = res;
+      if (res.ok) return res;
+    }
+    return firstResponse;
   }
 
 // Human-readable summary of the skipped buckets from collectFields.
@@ -269,7 +357,13 @@ function skippedText(res) {
   // (the sync quota can't hold them); the endpoint and model live in module
   // data, edited on the module's options page.
   const AI_KEY_LOCAL = "jtk-form-filler-ai-key";
+  const AI_KEYS_LOCAL = "jtk-form-filler-ai-keys";
+  const AI_ACTIVE_KEY_LOCAL = "jtk-form-filler-ai-active-key";
   const AI_CONTEXT_LOCAL = "jtk-form-filler-ai-context";
+  // Profiles are the bulkiest sync payload and can push the 100 KiB
+  // storage.sync quota.  They live in storage.local (unlimited) and are
+  // transparently merged on read / stripped on write.
+  const PROFILES_LOCAL = "jtk-form-filler-profiles";
   // Keep in sync with the DEFAULT_AI_INSTRUCTIONS constant in
   // modules/form-filler/options.js — the options page shows it as the built-in
   // default in the editable instructions field.
@@ -280,7 +374,8 @@ function skippedText(res) {
     "professional, natural tone, like a good cover letter or interview " +
     "answer. Output plain text only: no markdown formatting, no leading " +
     "label, no quotes around the answer.";
-  const AI_MAX_TOKENS = 600;
+  // Shared main-answer/retry budget; must cover hidden reasoning and visible text.
+  const AI_MAX_TOKENS = 1800;
   // Timeouts for the AI answer flow. Mutable (and exported) so harnesses can
   // shrink them; call = per-request cap, flow = overall cap across generation,
   // judge and the corrective retry (3 sequential per-call caps could otherwise
@@ -392,6 +487,32 @@ function skippedText(res) {
         .replace(/\s+/g, " ")
         .trim();
     }
+  }
+
+  // Greenhouse's board API returns the job content as HTML-escaped HTML
+  // (e.g. "&lt;div&gt;" for "<div>"); JSON.parse already handled the JSON
+  // escape layer, so exactly one entity-decode pass yields real HTML.
+  function decodeHtmlEntities(str) {
+    return String(str == null ? "" : str).replace(
+      /&(?:#(\d+)|#x([0-9a-f]+)|(amp|lt|gt|quot|apos|nbsp));/gi,
+      function (m, dec, hex, named) {
+        if (dec) return String.fromCharCode(parseInt(dec, 10));
+        if (hex) return String.fromCharCode(parseInt(hex, 16));
+        if (named === "amp") return "&";
+        if (named === "lt") return "<";
+        if (named === "gt") return ">";
+        if (named === "quot") return '"';
+        if (named === "apos") return "'";
+        if (named === "nbsp") return " ";
+        return m;
+      }
+    );
+  }
+
+  // MyGreenhouse API content -> plain text, capped like every other source.
+  function greenhouseContentToPlainText(content) {
+    const text = htmlToPlainText(decodeHtmlEntities(content));
+    return text ? truncateForField(text, JOB_DESC_MAX_CHARS) : "";
   }
 
   // Walk a parsed JSON-LD value (node, array, or @graph) for a JobPosting.
@@ -585,6 +706,136 @@ function skippedText(res) {
     }
   }
 
+  // MyGreenhouse Ask AI context. The "Quick Apply with MyGreenhouse" button
+  // gates the page (matched in the content script DOM, never by URL, so any
+  // company domain and cross-origin application iframe works). The application
+  // form often lives in a cross-origin iframe while the description sits in
+  // the company's top frame, so both are probed: the button in either one
+  // gates, the description is taken from whichever frame has it, and
+  // Greenhouse's public board API is the final fallback when the org + job id
+  // are derivable from the DOM. Fail-open: any miss/error returns empty
+  // strings so answering still proceeds.
+  async function resolveGreenhouseJobDescription(tab, frameId, flowId) {
+    const empty = { title: "", description: "", source: "none", adapterId: "" };
+    const tabUrl = String((tab && tab.url) || "");
+    if (!tabUrl) return empty;
+
+    const cacheKey = "greenhouse:" + tabUrl;
+    const cached = jobDescCache.get(cacheKey);
+    if (cached && cached.description) {
+      aiLog(flowId, "job description cache hit", tabUrl);
+      return {
+        title: cached.title || "",
+        description: cached.description,
+        source: "cache",
+        adapterId: "greenhouse"
+      };
+    }
+
+    const frameIds = [];
+    if (frameId != null && frameId !== 0) frameIds.push(frameId);
+    frameIds.push(0);
+
+    let gate = false;
+    let org = "";
+    let jobId = "";
+    let title = "";
+    let description = "";
+    for (let i = 0; i < frameIds.length; i++) {
+      const fromFrame = await sendToContent(
+        tab,
+        { type: "form-filler:getJobDescription", flowId: flowId },
+        frameIds[i]
+      );
+      if (!fromFrame) continue;
+      if (fromFrame.adapterId === "greenhouse") gate = true;
+      if (fromFrame.org) org = org || String(fromFrame.org);
+      if (fromFrame.jobId) jobId = jobId || String(fromFrame.jobId);
+      if (fromFrame.jobDescription && !description) {
+        description = String(fromFrame.jobDescription);
+        title = String(fromFrame.jobTitle || "");
+      }
+    }
+    if (!gate) return empty;
+
+    if (description) {
+      const result = {
+        title: title,
+        description: truncateForField(description, JOB_DESC_MAX_CHARS)
+      };
+      jobDescCache.set(cacheKey, result);
+      aiLog(
+        flowId,
+        "job description from page",
+        result.description.length + " chars" +
+          (result.title ? ' ("' + result.title.slice(0, 80) + '")' : "")
+      );
+      return {
+        title: result.title,
+        description: result.description,
+        source: "page",
+        adapterId: "greenhouse"
+      };
+    }
+
+    const miss = { title: "", description: "", source: "miss", adapterId: "greenhouse" };
+    if (!org || !jobId) {
+      aiLog(
+        flowId,
+        "job description miss",
+        "MyGreenhouse gate hit but no description or org/job id in the DOM"
+      );
+      return miss;
+    }
+
+    const apiUrl =
+      "https://boards-api.greenhouse.io/v1/boards/" +
+      encodeURIComponent(org) + "/jobs/" + encodeURIComponent(jobId);
+    const controller = new AbortController();
+    const timer = setTimeout(function () {
+      controller.abort();
+    }, JOB_DESC_FETCH_MS);
+    try {
+      aiLog(flowId, "job description fetch", apiUrl);
+      const res = await fetch(apiUrl, {
+        credentials: "include",
+        signal: controller.signal
+      });
+      if (!res.ok) {
+        aiLog(flowId, "job description fetch failed", "HTTP " + res.status);
+        return miss;
+      }
+      const data = await res.json();
+      const apiText = greenhouseContentToPlainText(data && data.content);
+      if (apiText) {
+        const apiTitle = String((data && data.title) || "").replace(/\s+/g, " ").trim();
+        const result = {
+          title: apiTitle || title,
+          description: apiText
+        };
+        jobDescCache.set(cacheKey, result);
+        aiLog(flowId, "job description fetched", result.description.length + " chars");
+        return {
+          title: result.title,
+          description: result.description,
+          source: "fetch",
+          adapterId: "greenhouse"
+        };
+      }
+      aiLog(flowId, "job description parse miss", apiUrl);
+      return miss;
+    } catch (err) {
+      aiLog(
+        flowId,
+        "job description fetch error",
+        String((err && err.message) || err).slice(0, 200)
+      );
+      return miss;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Build the system + user messages for the AI answer flow. `entries` are the
   // user's stored { title, body } background entries (empty bodies are
   // dropped); `fieldInfo` is the captured field description, so the question,
@@ -760,6 +1011,12 @@ function skippedText(res) {
       "-> " + endpoint + " (model " + model + ", messages " + messages.length +
         ", timeout " + aiTimeouts.call + "ms)"
     );
+    const payload = {
+      model: model,
+      messages: messages,
+      temperature: typeof temperature === "number" ? temperature : 0.7,
+      max_tokens: typeof maxTokens === "number" ? maxTokens : AI_MAX_TOKENS
+    };
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -767,18 +1024,24 @@ function skippedText(res) {
           Authorization: "Bearer " + apiKey,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          model: model,
-          messages: messages,
-          temperature: typeof temperature === "number" ? temperature : 0.7,
-          max_tokens: typeof maxTokens === "number" ? maxTokens : AI_MAX_TOKENS
-        }),
+        body: JSON.stringify(payload),
         signal: controller.signal
       });
       if (!res.ok) {
         let snippet = "";
         try {
-          snippet = (await res.text()).trim().slice(0, 120);
+          // res.text() can hang if the body stream stalls — AbortController
+          // doesn't cancel in-progress body reads. Race it against the
+          // controller's signal so a stalled body still triggers the timeout.
+          snippet = (await Promise.race([
+            res.text(),
+            new Promise(function (_, reject) {
+              if (controller.signal.aborted) { reject(controller.signal.reason || new DOMException("Aborted", "AbortError")); return; }
+              controller.signal.addEventListener("abort", function () {
+                reject(controller.signal.reason || new DOMException("Aborted", "AbortError"));
+              }, { once: true });
+            })
+          ])).trim().slice(0, 120);
         } catch (err) {
           // Keep the bare status line.
         }
@@ -789,14 +1052,54 @@ function skippedText(res) {
         );
         throw new Error("HTTP " + res.status + " \u2014 " + snippet);
       }
-      const data = await res.json();
+      // res.json() can hang if the body stream stalls — AbortController
+      // doesn't cancel in-progress body reads. Race it against the
+      // controller's signal so a stalled body still triggers the timeout.
+      const data = await Promise.race([
+        res.json(),
+        new Promise(function (_, reject) {
+          if (controller.signal.aborted) { reject(controller.signal.reason || new DOMException("Aborted", "AbortError")); return; }
+          controller.signal.addEventListener("abort", function () {
+            reject(controller.signal.reason || new DOMException("Aborted", "AbortError"));
+          }, { once: true });
+        })
+      ]);
       const content =
         data && data.choices && data.choices[0] && data.choices[0].message
           ? data.choices[0].message.content
           : null;
       if (typeof content !== "string" || content.trim() === "") {
-        aiError(logId || "?", "fetch " + step + " empty answer", "response had no usable content");
-        throw new Error("The API returned no answer.");
+        // Diagnostic: log the actual response shape so we can diagnose *why*
+        // the content is empty — finish_reason, refusal, top-level keys, etc.
+        const choice = data && data.choices && data.choices[0];
+        const diag = {
+          topKeys: data ? Object.keys(data) : [],
+          finishReason: choice ? choice.finish_reason : "(no choice)",
+          hasMessage: !!(choice && choice.message),
+          messageKeys: choice && choice.message ? Object.keys(choice.message) : [],
+          contentRaw: choice && choice.message ? choice.message.content : "(missing)",
+          refusal: choice && choice.message ? choice.message.refusal : undefined,
+          choicesLength: data && Array.isArray(data.choices) ? data.choices.length : "(not array)",
+          native_finish_reason: choice ? choice.native_finish_reason : "(no choice)",
+          errorCode:
+            choice && choice.error && choice.error.code != null
+              ? String(choice.error.code).slice(0, 80)
+              : undefined,
+          errorMessage:
+            choice && choice.error && choice.error.message != null
+              ? String(choice.error.message).slice(0, 200)
+              : undefined
+        };
+        aiError(
+          logId || "?",
+          "fetch " + step + " empty answer",
+          JSON.stringify(diag)
+        );
+        throw new Error(
+          choice && choice.finish_reason === "length"
+            ? "The model reached its output limit before producing an answer."
+            : "The API returned no answer."
+        );
       }
       aiLog(logId || "?", "fetch " + step + " ok", "HTTP " + res.status + ", " + content.length + " chars");
       return content.trim();
@@ -819,21 +1122,88 @@ function skippedText(res) {
   // storage.local, with a fallback to the legacy module-data entries until the
   // options page has migrated them.
   async function readAIConfig(api) {
-    const data = await api.getModuleData(MODULE_ID);
-    const [kr, ctx] = await Promise.all([
+    const data = await readFormData(api);
+    const [kr, ctx, keysResult, activeResult] = await Promise.all([
       browser.storage.local.get(AI_KEY_LOCAL),
-      browser.storage.local.get(AI_CONTEXT_LOCAL)
+      browser.storage.local.get(AI_CONTEXT_LOCAL),
+      browser.storage.local.get(AI_KEYS_LOCAL),
+      browser.storage.local.get(AI_ACTIVE_KEY_LOCAL)
     ]);
     const localEntries = Array.isArray(ctx[AI_CONTEXT_LOCAL]) ? ctx[AI_CONTEXT_LOCAL] : [];
+    // Resolve the active API key from the multi-key list; fall back to the
+    // legacy single key until the options page has migrated it.
+    const aiKeys = Array.isArray(keysResult[AI_KEYS_LOCAL]) ? keysResult[AI_KEYS_LOCAL] : [];
+    const activeKeyId = activeResult[AI_ACTIVE_KEY_LOCAL] || null;
+    let apiKey = kr[AI_KEY_LOCAL] || "";
+    if (aiKeys.length) {
+      const active = activeKeyId
+        ? aiKeys.find(function (k) { return k.id === activeKeyId; })
+        : null;
+      apiKey = (active && active.key) || aiKeys[0].key || "";
+    }
     return {
       endpoint: data.aiEndpoint,
       model: data.aiModel,
       entries: localEntries.length
         ? localEntries
         : Array.isArray(data.aiContext) ? data.aiContext : [],
-      apiKey: kr[AI_KEY_LOCAL] || "",
+      apiKey: apiKey,
       instructions: data.aiInstructions || ""
     };
+  }
+
+  // Profile offloading helpers: profiles are stored in storage.local to
+  // avoid the 100 KiB sync quota.  readFormData merges the local copy back
+  // into the module data; writeFormData strips profiles from the sync
+  // payload (passing `undefined` tells setModuleData to delete the key).
+
+  async function readFormData(api) {
+    const data = await api.getModuleData(MODULE_ID);
+    try {
+      const local = await browser.storage.local.get(PROFILES_LOCAL);
+      if (local[PROFILES_LOCAL] !== undefined) {
+        console.log("[Form Filler] readFormData: profiles found in storage.local (" +
+          Object.keys(local[PROFILES_LOCAL]).length + " profiles)");
+        data.profiles = local[PROFILES_LOCAL];
+      } else if (data.profiles && Object.keys(data.profiles).length > 0) {
+        // First access after upgrade: copy from sync to local, then strip
+        // from sync to immediately free quota headroom.  Verify the local
+        // write landed before removing the sync copy.
+        console.log("[Form Filler] readFormData: migrating " +
+          Object.keys(data.profiles).length + " profiles from sync to local...");
+        await browser.storage.local.set({ [PROFILES_LOCAL]: data.profiles });
+        const verify = await browser.storage.local.get(PROFILES_LOCAL);
+        if (verify[PROFILES_LOCAL] && Object.keys(verify[PROFILES_LOCAL]).length > 0) {
+          console.log("[Form Filler] readFormData: local write verified, stripping profiles from sync");
+          try {
+            await api.setModuleData(MODULE_ID, { profiles: undefined });
+            console.log("[Form Filler] readFormData: sync cleanup succeeded");
+          } catch (cleanupErr) {
+            console.warn("[Form Filler] readFormData: sync cleanup failed (will retry on next write):", cleanupErr && cleanupErr.message);
+          }
+        } else {
+          console.warn("[Form Filler] readFormData: local write verification FAILED — keeping sync copy");
+        }
+      } else {
+        console.log("[Form Filler] readFormData: no profiles in local or sync");
+      }
+    } catch (e) {
+      console.warn("[Form Filler] readFormData: migration error:", e && e.message);
+    }
+    return data;
+  }
+
+  async function writeFormData(api, data) {
+    // Always ensure profiles are NOT written to sync — they live in
+    // storage.local.  If the caller provided profiles, persist them to
+    // local first.  Either way, set profiles to undefined so setModuleData
+    // deletes the key from the sync blob.  This also retries the cleanup
+    // if the initial migration's sync write failed.
+    if ("profiles" in data) {
+      await browser.storage.local.set({ [PROFILES_LOCAL]: data.profiles || {} });
+    }
+    data.profiles = undefined;
+    await api.setModuleData(MODULE_ID, data);
   }
 
   // Context-menu "Answer with AI" flow: capture the right-clicked field, build
@@ -848,7 +1218,7 @@ function skippedText(res) {
     const flowId = Math.random().toString(36).slice(2, 8);
     const frameId = info.frameId == null ? 0 : info.frameId;
     const flowStartedAt = Date.now();
-    const modData = await api.getModuleData(MODULE_ID);
+    const modData = await readFormData(api);
     const debug = modData && modData.debug === true;
 
     // Background console always; page console only when debug is on.
@@ -1015,13 +1385,16 @@ function skippedText(res) {
     let text;
     let retries = 0;
     try {
-      // Optional job-posting context from a known board adapter (Ashby first).
-      // Fail-open: an empty result leaves the prompt unchanged from before.
-      // Runs inside the flow try so a lookup failure hides the spinner and
-      // toasts cleanly instead of leaving it hanging. Copy the capture so we
-      // never leave sticky jobDescription on a reused object (harnesses stub a
-      // single captureResponse).
-      const jd = await resolveJobDescription(tab.url, tab, flowId);
+      // Optional job-posting context from a known board adapter (Ashby by URL)
+      // or a button-gated MyGreenhouse application (any company domain /
+      // iframe embed). Fail-open: an empty result leaves the prompt unchanged
+      // from before. Runs inside the flow try so a lookup failure hides the
+      // spinner and toasts cleanly instead of leaving it hanging. Copy the
+      // capture so we never leave sticky jobDescription on a reused object
+      // (harnesses stub a single captureResponse).
+      const jd = findJobDescAdapter(String(tab.url || ""))
+        ? await resolveJobDescription(tab.url, tab, flowId)
+        : await resolveGreenhouseJobDescription(tab, frameId, flowId);
       const fieldInfo = Object.assign({}, captured);
       if (jd && jd.description) {
         fieldInfo.jobDescription = jd.description;
@@ -1172,42 +1545,34 @@ function skippedText(res) {
         sendToContent(
           tab,
           {
-            type: "form-filler:aiSpinner",
-            show: false,
+            type: "form-filler:aiError",
             flowId: flowId,
-            targetElementId: info.targetElementId
+            targetElementId: info.targetElementId,
+            error:
+              flowTimedOut === true
+                ? "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds."
+                : err && err.name === "AbortError"
+                  ? "AI answer timed out \u2014 the endpoint did not respond."
+                  : "AI answer failed: " + String((err && err.message) || err).slice(0, 200)
           },
           frameId
         );
-        const msg =
-          flowTimedOut === true
-            ? "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds."
-            : err && err.name === "AbortError"
-              ? "AI answer timed out \u2014 the endpoint did not respond."
-              : "AI answer failed: " + String((err && err.message) || err).slice(0, 200);
-        api.notify(tab.id, "Job App Toolkit", msg, null, "form-filler");
         return;
       }
 
       if (flowAbort.signal.aborted) {
         // Deadline fired between the last LLM call and the fill.
         dbg("flow deadline reached before fill");
+        const timeoutMsg = "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds.";
         sendToContent(
           tab,
           {
-            type: "form-filler:aiSpinner",
-            show: false,
+            type: "form-filler:aiError",
             flowId: flowId,
-            targetElementId: info.targetElementId
+            targetElementId: info.targetElementId,
+            error: timeoutMsg
           },
           frameId
-        );
-        api.notify(
-          tab.id,
-          "Job App Toolkit",
-          "AI answer timed out after " + Math.round(aiTimeouts.flow / 1000) + " seconds.",
-          null,
-          "form-filler"
         );
         return;
       }
@@ -1238,19 +1603,12 @@ function skippedText(res) {
         sendToContent(
           tab,
           {
-            type: "form-filler:aiSpinner",
-            show: false,
+            type: "form-filler:aiError",
             flowId: flowId,
-            targetElementId: info.targetElementId
+            targetElementId: info.targetElementId,
+            error: "Could not fill the field: " + ((filled && filled.error) || "field no longer available")
           },
           frameId
-        );
-        api.notify(
-          tab.id,
-          "Job App Toolkit",
-          "Could not fill the field: " + ((filled && filled.error) || "field no longer available"),
-          null,
-          "form-filler"
         );
         return;
       }
@@ -1296,9 +1654,13 @@ function skippedText(res) {
     const profile = data.profiles[profileName];
     profile.fields = profile.fields || {};
     for (const f of fields) {
-      profile.fields[f.name] = { value: f.value, label: f.fieldLabel || f.name };
+      profile.fields[f.name] = {
+        value: f.value,
+        label: f.fieldLabel || f.name,
+        type: f.type || ""
+      };
     }
-    await api.setModuleData(MODULE_ID, {
+    await writeFormData(api, {
       profiles: data.profiles,
       activeProfile: data.activeProfile
     });
@@ -1336,6 +1698,20 @@ function skippedText(res) {
 
   async function writeApplications(list) {
     await browser.storage.local.set({ [APPLICATIONS_LOCAL]: list });
+  }
+
+  // Normalize an application URL for duplicate/look-up checks. URL requires an
+  // absolute URL here, and clearing only hash preserves query parameters that
+  // may carry the job identity. Invalid or missing values do not match.
+  function normalizeApplicationUrl(urlStr) {
+    if (typeof urlStr !== "string" || urlStr.trim() === "") return "";
+    try {
+      const url = new URL(urlStr);
+      url.hash = "";
+      return url.toString();
+    } catch (err) {
+      return "";
+    }
   }
 
   // Normalize a title/company for job matching: lowercase, collapse every run
@@ -1410,6 +1786,19 @@ function skippedText(res) {
     return { ok: true, applications: applications, stages: APPLICATION_STAGES };
   }
 
+  // Check only whether the requester-provided posting URL is already recorded;
+  // never return the matching application's metadata.
+  async function hasAppliedToCurrentUrlAction(message) {
+    const requestedUrl = normalizeApplicationUrl(message && message.url);
+    if (!requestedUrl) return { alreadyApplied: false };
+    const applications = await readApplications();
+    return {
+      alreadyApplied: applications.some(function (application) {
+        return application && normalizeApplicationUrl(application.url) === requestedUrl;
+      })
+    };
+  }
+
   // Set an entry's stage (custom stages allowed); a missing id is a no-op.
   async function setApplicationStageAction(message) {
     const id = message.id;
@@ -1450,6 +1839,181 @@ function skippedText(res) {
   }
 
   // ------------------------------------------------------------------
+  // Wrong autofill corrections (exclusions, storage.local)
+  // ------------------------------------------------------------------
+
+  // Fields the user marked as incorrectly autofilled. Exclusions are GLOBAL
+  // (not per-site) and live in browser.storage.local — same pattern as the AI
+  // background entries and logged applications. Each record is keyed by a
+  // signature over the profile key and the normalized candidate strings, so
+  // the same field on any site is skipped by the matcher.
+  const EXCLUSIONS_LOCAL = "jtk-form-filler-exclusions";
+
+  async function readExclusions() {
+    const res = await browser.storage.local.get(EXCLUSIONS_LOCAL);
+    return res && res[EXCLUSIONS_LOCAL] && typeof res[EXCLUSIONS_LOCAL] === "object"
+      ? res[EXCLUSIONS_LOCAL]
+      : {};
+  }
+
+  async function writeExclusions(map) {
+    await browser.storage.local.set({ [EXCLUSIONS_LOCAL]: map });
+  }
+
+  // Deterministic key for an exclusion: profile key + sorted normalized
+  // candidates, so the order the content script reports them in never
+  // produces a duplicate record.
+  function exclusionSignature(profileKey, fieldNorms) {
+    return profileKey + "\u0000" + fieldNorms.slice().sort().join("\u0001");
+  }
+
+  // Keep only non-empty strings (trimmed — whitespace-only norms carry no
+  // identity and can never match a normalized candidate), dedupe preserving
+  // order; [] when nothing usable remains.
+  function sanitizeNorms(fieldNorms) {
+    const out = [];
+    if (Array.isArray(fieldNorms)) {
+      for (const norm of fieldNorms) {
+        const clean = typeof norm === "string" ? norm.trim() : "";
+        if (clean !== "" && out.indexOf(clean) === -1) {
+          out.push(clean);
+        }
+      }
+    }
+    return out;
+  }
+
+  // Record a field the user marked as incorrectly autofilled so the matcher
+  // skips it on every site.
+  async function addExclusionAction(message) {
+    const profileKey = typeof message.profileKey === "string" ? message.profileKey : "";
+    const norms = sanitizeNorms(message.fieldNorms);
+    if (profileKey === "" || norms.length === 0) {
+      return { ok: false, error: "Invalid exclusion." };
+    }
+    const map = await readExclusions();
+    map[exclusionSignature(profileKey, norms)] = {
+      profileKey: profileKey,
+      fieldNorms: norms,
+      ts: Date.now()
+    };
+    await writeExclusions(map);
+    return { ok: true };
+  }
+
+  // Remove a recorded exclusion (the toast's Undo action) and ask the
+  // originating frame to re-fill the cleared value.
+  async function undoExclusionAction(message, sender) {
+    const profileKey = typeof message.profileKey === "string" ? message.profileKey : "";
+    const norms = sanitizeNorms(message.fieldNorms);
+    if (profileKey === "" || norms.length === 0) {
+      return { ok: false, error: "Invalid exclusion." };
+    }
+    const map = await readExclusions();
+    const sig = exclusionSignature(profileKey, norms);
+    if (Object.prototype.hasOwnProperty.call(map, sig)) {
+      delete map[sig];
+    }
+    await writeExclusions(map);
+    if (sender && sender.tab && typeof sender.tab.id === "number") {
+      try {
+        await sendToContent(
+          sender.tab,
+          { type: "form-filler:undoExclusion", profileKey: profileKey, fieldNorms: norms },
+          sender.frameId
+        );
+      } catch (err) {
+        // The frame may have navigated away; the exclusion is already removed.
+      }
+    }
+    return { ok: true };
+  }
+
+  async function clearExclusionsAction() {
+    const map = await readExclusions();
+    const count = Object.keys(map).length;
+    await writeExclusions({});
+    return { ok: true, count: count };
+  }
+
+  async function getExclusionsAction() {
+    const map = await readExclusions();
+    return {
+      ok: true,
+      count: Object.keys(map).length,
+      records: Object.keys(map)
+        .map((sig) => map[sig])
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Page templates (saved page shapes, storage.local)
+  // ------------------------------------------------------------------
+
+  // Saved page templates live in browser.storage.local — same pattern as the
+  // exclusions and logged applications. Each record is keyed by a generated
+  // id and stores the ordered field shape (normalized identities) plus the
+  // captured values, so a matching page can be filled from it.
+  const TEMPLATES_LOCAL = "jtk-form-filler-templates";
+
+  // Save a template captured by the content script (the user named it and the
+  // page's fields were collected). shape is the ordered normalized field
+  // identities; fields carries the actual values.
+  async function saveTemplateAction(message) {
+    const name = typeof message.name === "string" ? message.name.trim() : "";
+    if (!name) return { ok: false, error: "Template name is required." };
+    if (!Array.isArray(message.shape) || !message.shape.length) {
+      return { ok: false, error: "No fields to save." };
+    }
+    if (!Array.isArray(message.fields) || !message.fields.length) {
+      return { ok: false, error: "No fields to save." };
+    }
+
+    const res = await browser.storage.local.get(TEMPLATES_LOCAL);
+    const map =
+      res && res[TEMPLATES_LOCAL] && typeof res[TEMPLATES_LOCAL] === "object"
+        ? res[TEMPLATES_LOCAL]
+        : {};
+
+    // Generate a unique id (timestamp base + random suffix).
+    const id = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+
+    map[id] = {
+      name: name,
+      shape: message.shape,
+      fields: message.fields,
+      savedUrl: typeof message.url === "string" ? message.url : "",
+      createdAt: Date.now()
+    };
+
+    await browser.storage.local.set({ [TEMPLATES_LOCAL]: map });
+    return { ok: true };
+  }
+
+  async function getTemplatesAction() {
+    const res = await browser.storage.local.get(TEMPLATES_LOCAL);
+    const map =
+      res && res[TEMPLATES_LOCAL] && typeof res[TEMPLATES_LOCAL] === "object"
+        ? res[TEMPLATES_LOCAL]
+        : {};
+    return { ok: true, templates: map };
+  }
+
+  async function deleteTemplateAction(message) {
+    if (!message.templateId) return { ok: false, error: "Missing templateId." };
+    const res = await browser.storage.local.get(TEMPLATES_LOCAL);
+    const map =
+      res && res[TEMPLATES_LOCAL] && typeof res[TEMPLATES_LOCAL] === "object"
+        ? res[TEMPLATES_LOCAL]
+        : {};
+    if (!map[message.templateId]) return { ok: true }; // already gone
+    delete map[message.templateId];
+    await browser.storage.local.set({ [TEMPLATES_LOCAL]: map });
+    return { ok: true };
+  }
+
+  // ------------------------------------------------------------------
   // Quick actions (popup) + request handlers (options page)
   // ------------------------------------------------------------------
 
@@ -1457,7 +2021,7 @@ function skippedText(res) {
 async function fillPageAction(api) {
     const tab = await getWebTab(api);
     if (!tab) return { ok: false, error: "No web page to fill." };
-    const data = await api.getModuleData(MODULE_ID);
+    const data = await readFormData(api);
     const profileName = data.activeProfile;
     if (!profileName || !data.profiles || !data.profiles[profileName]) {
       return { ok: false, error: "No active profile. Open the Form Filler options page." };
@@ -1483,7 +2047,7 @@ async function fillPageAction(api) {
     if (!focused || typeof focused.name !== "string" || focused.name === "") {
       return { ok: false, error: "No focused form field detected." };
     }
-    const data = await api.getModuleData(MODULE_ID);
+    const data = await readFormData(api);
     const profileName = data.activeProfile;
     if (!profileName || !data.profiles || !data.profiles[profileName]) {
       return { ok: false, error: "No active profile. Open the Form Filler options page." };
@@ -1498,7 +2062,7 @@ async function fillPageAction(api) {
       value: focused.value,
       label: focused.fieldLabel || focused.name
     };
-    await api.setModuleData(MODULE_ID, {
+    await writeFormData(api, {
       profiles: data.profiles,
       activeProfile: data.activeProfile
     });
@@ -1512,7 +2076,7 @@ async function fillPageAction(api) {
   async function addAllFieldsAction(api) {
     const tab = await getWebTab(api);
     if (!tab) return { ok: false, error: "No web page to read." };
-    const data = await api.getModuleData(MODULE_ID);
+    const data = await readFormData(api);
     const profileName = data.activeProfile;
     if (!profileName || !data.profiles || !data.profiles[profileName]) {
       return { ok: false, error: "No active profile. Open the Form Filler options page." };
@@ -1541,7 +2105,7 @@ async function fillPageAction(api) {
     if (!isValidFieldValue(field.value)) {
       return { ok: false, error: "Field value is required." };
     }
-    const data = await api.getModuleData(MODULE_ID);
+    const data = await readFormData(api);
     const profileName = data.activeProfile;
     if (!profileName || !data.profiles || !data.profiles[profileName]) {
       return { ok: false, error: "No active profile. Open the Form Filler options page." };
@@ -1551,7 +2115,7 @@ async function fillPageAction(api) {
     const label = field.fieldLabel || field.name;
     const exists = Object.prototype.hasOwnProperty.call(profile.fields, field.name);
     profile.fields[field.name] = { value: field.value, label: label };
-    await api.setModuleData(MODULE_ID, {
+    await writeFormData(api, {
       profiles: data.profiles,
       activeProfile: data.activeProfile
     });
@@ -1567,36 +2131,59 @@ async function fillPageAction(api) {
   // Context menu (page-level actions)
   // ------------------------------------------------------------------
 
-  // Register the menu items under the core root menu: the page-level actions
-  // plus the per-field "Answer with AI" item (which targets the right-clicked
-  // editable element); the remaining per-field flows live on the in-page
-  // buttons.
+  // Register the module's menu items under the core root menu: the page-level
+  // actions and the single-field items first (flat, so they appear at the
+  // top), then a "Save fields" submenu last (its children are "Add all
+  // fields" and "Save page template"); the remaining per-field flows live on
+  // the in-page buttons.
   function createContextMenu(api) {
+    moduleApiRef = api;
+    // Flat items first (appear at top).
     browser.contextMenus.create({
-      id: MENU.root,
-      title: "Form Filler",
+      id: MENU.fillPage,
+      title: "Autofill page",
+      parentId: api.MENU_ROOT_ID,
+      contexts: ["all"]
+    });
+    browser.contextMenus.create({
+      id: MENU.fillFieldOnce,
+      title: "Autofill this field once",
+      parentId: api.MENU_ROOT_ID,
+      contexts: ["editable"]
+    });
+    browser.contextMenus.create({
+      id: MENU.aiAnswer,
+      title: "Answer with AI",
+      parentId: api.MENU_ROOT_ID,
+      contexts: ["editable"]
+    });
+    // Save fields submenu (LAST — least used).
+    browser.contextMenus.create({
+      id: MENU.saveFields,
+      title: "Save fields",
       parentId: api.MENU_ROOT_ID,
       contexts: ["all"]
     });
     browser.contextMenus.create({
       id: MENU.addAll,
-      title: "Add all fields to profile",
-      parentId: MENU.root,
+      title: "Add all fields",
+      parentId: MENU.saveFields,
       contexts: ["all"]
     });
     browser.contextMenus.create({
-      id: MENU.fillPage,
-      title: "Fill page from profile",
-      parentId: MENU.root,
+      id: MENU.saveTemplate,
+      title: "Save page template",
+      parentId: MENU.saveFields,
       contexts: ["all"]
     });
-    browser.contextMenus.create({
-      id: MENU.aiAnswer,
-      title: "Answer with AI",
-      parentId: MENU.root,
-      contexts: ["editable"]
-    });
-    return [MENU.root, MENU.addAll, MENU.fillPage, MENU.aiAnswer];
+    return [
+      MENU.fillPage,
+      MENU.fillFieldOnce,
+      MENU.aiAnswer,
+      MENU.saveFields,
+      MENU.addAll,
+      MENU.saveTemplate
+    ];
   }
 
   // Add the tab's hostname to the module whitelist once, so the in-page
@@ -1608,7 +2195,53 @@ async function fillPageAction(api) {
     data.whitelist = Array.isArray(data.whitelist) ? data.whitelist.slice() : [];
     if (data.whitelist.indexOf(host) !== -1) return;
     data.whitelist.push(host);
-    await api.setModuleData(MODULE_ID, { whitelist: data.whitelist });
+    await writeFormData(api, { whitelist: data.whitelist });
+  }
+
+  // Shared implementation for the context-menu item and Ctrl+Alt+F. A menu
+  // target keeps the exact clicked frame/target behavior. The keyboard path
+  // deliberately sends the same no-target message to every known frame,
+  // allowing the content-side active-element fallback to find a focused field
+  // inside a same-origin iframe.
+  async function fillFieldOnceAction(tab, api, targetElementId, frameId, acrossFrames) {
+    const data = await readFormData(api);
+    const profileName = data.activeProfile;
+    if (!profileName || !data.profiles || !data.profiles[profileName]) {
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        "No active profile. Open the Form Filler options page and create or select one.",
+        null,
+        "form-filler"
+      );
+      return;
+    }
+    const profile = data.profiles[profileName];
+    const message = {
+      type: "form-filler:fillFieldOnce",
+      profileFields: profile.fields || {},
+      targetElementId: targetElementId
+    };
+    const res = acrossFrames
+      ? await sendToFocusedContent(tab, message)
+      : await sendToContent(tab, message, frameId);
+    if (!res || !res.ok) {
+      api.notify(
+        tab.id,
+        "Job App Toolkit",
+        (res && res.error) || "Cannot fill on this page.",
+        null,
+        "form-filler"
+      );
+      return;
+    }
+    api.notify(
+      tab.id,
+      "Job App Toolkit",
+      'Filled "' + (res.label || res.key) + '".',
+      null,
+      "form-filler"
+    );
   }
 
   // Menu click dispatch. The core calls this for every module on every menu
@@ -1617,15 +2250,26 @@ async function fillPageAction(api) {
   async function handleMenuClick(info, tab, api) {
     if (
       !info ||
-      (info.menuItemId !== MENU.root &&
-        info.menuItemId !== MENU.addAll &&
+      (info.menuItemId !== MENU.addAll &&
         info.menuItemId !== MENU.fillPage &&
-        info.menuItemId !== MENU.aiAnswer)
+        info.menuItemId !== MENU.fillFieldOnce &&
+        info.menuItemId !== MENU.aiAnswer &&
+        info.menuItemId !== MENU.saveFields &&
+        info.menuItemId !== MENU.saveTemplate)
     ) {
       return;
     }
+    // The "Save fields" submenu is just a container — clicking it does nothing.
+    if (info.menuItemId === MENU.saveFields) return;
     if (!tab || typeof tab.id !== "number") {
       console.warn("[Form Filler] menu click without a valid tab");
+      return;
+    }
+    // Ask the clicked frame's content script to prompt for a template name and
+    // capture the page's fields (it saves via form-filler:saveTemplate).
+    if (info.menuItemId === MENU.saveTemplate) {
+      if (!tab || typeof tab.id !== "number") return;
+      sendToContent(tab, { type: "form-filler:promptSaveTemplate" }, info.frameId).catch(function () {});
       return;
     }
     // The AI flow needs no active profile: it answers from the stored
@@ -1635,7 +2279,11 @@ async function fillPageAction(api) {
       await answerFieldWithAI(info, tab, api);
       return;
     }
-    const data = await api.getModuleData(MODULE_ID);
+    if (info.menuItemId === MENU.fillFieldOnce) {
+      await fillFieldOnceAction(tab, api, info.targetElementId, info.frameId, false);
+      return;
+    }
+    const data = await readFormData(api);
     const profileName = data.activeProfile;
     if (!profileName || !data.profiles || !data.profiles[profileName]) {
       api.notify(
@@ -1699,6 +2347,9 @@ async function fillPageAction(api) {
     if (message.type === "form-filler:getApplications") {
       return getApplicationsAction();
     }
+    if (message.type === "form-filler:hasAppliedToCurrentUrl") {
+      return hasAppliedToCurrentUrlAction(message);
+    }
     if (message.type === "form-filler:setApplicationStage") {
       return setApplicationStageAction(message);
     }
@@ -1708,6 +2359,27 @@ async function fillPageAction(api) {
     if (message.type === "form-filler:setApplicationCompany") {
       return setApplicationCompanyAction(message);
     }
+    if (message.type === "form-filler:addExclusion") {
+      return addExclusionAction(message);
+    }
+    if (message.type === "form-filler:undoExclusion") {
+      return undoExclusionAction(message, sender);
+    }
+    if (message.type === "form-filler:clearExclusions") {
+      return clearExclusionsAction();
+    }
+    if (message.type === "form-filler:getExclusions") {
+      return getExclusionsAction();
+    }
+    if (message.type === "form-filler:saveTemplate") {
+      return saveTemplateAction(message);
+    }
+    if (message.type === "form-filler:getTemplates") {
+      return getTemplatesAction();
+    }
+    if (message.type === "form-filler:deleteTemplate") {
+      return deleteTemplateAction(message);
+    }
     return undefined;
   }
 
@@ -1716,14 +2388,17 @@ async function fillPageAction(api) {
   // ------------------------------------------------------------------
 
   // The sync payload minus the keys that must not travel with an export: the
-  // `active` flag (the core tracks that separately) and the legacy `aiContext`
+  // `active` flag (the core tracks that separately), the legacy `aiContext`
   // (the AI background entries live in storage.local now — mirroring
-  // readAIConfig, local is authoritative, so the sync copy is dropped).
+  // readAIConfig, local is authoritative, so the sync copy is dropped), and
+  // `profiles` (also in storage.local; the local export carries them).
   function exportableData(payload) {
     const out = {};
     if (payload && typeof payload === "object") {
       Object.keys(payload).forEach(function (k) {
-        if (k !== "active" && k !== "aiContext") out[k] = payload[k];
+        if (k !== "active" && k !== "aiContext" && k !== "profiles") {
+          out[k] = payload[k];
+        }
       });
     }
     return out;
@@ -1731,14 +2406,21 @@ async function fillPageAction(api) {
 
   // Export the module config: the sync payload (no active flag, no legacy
   // aiContext) plus the storage.local user data — the AI background entries
-  // always, the API key only when opts.includeApiKey is truthy and a key is
-  // actually stored. An absent key is omitted entirely, never exported empty.
+  // always, the API keys (multi-key list + active id, and the legacy single
+  // key for pre-migration installs) only when opts.includeApiKey is truthy and
+  // a key is actually stored. An absent key is omitted entirely, never
+  // exported empty.
   async function exportData(api, opts) {
-    const data = exportableData(await api.getModuleData(MODULE_ID));
-    const [ctx, key, apps] = await Promise.all([
+    const data = exportableData(await readFormData(api));
+    const [ctx, key, keys, active, apps, excl, tmpl, prof] = await Promise.all([
       browser.storage.local.get(AI_CONTEXT_LOCAL),
       browser.storage.local.get(AI_KEY_LOCAL),
-      browser.storage.local.get(APPLICATIONS_LOCAL)
+      browser.storage.local.get(AI_KEYS_LOCAL),
+      browser.storage.local.get(AI_ACTIVE_KEY_LOCAL),
+      browser.storage.local.get(APPLICATIONS_LOCAL),
+      browser.storage.local.get(EXCLUSIONS_LOCAL),
+      browser.storage.local.get(TEMPLATES_LOCAL),
+      browser.storage.local.get(PROFILES_LOCAL)
     ]);
     const local = {};
     if (ctx[AI_CONTEXT_LOCAL] !== undefined) {
@@ -1747,13 +2429,25 @@ async function fillPageAction(api) {
     if (apps[APPLICATIONS_LOCAL] !== undefined) {
       local[APPLICATIONS_LOCAL] = apps[APPLICATIONS_LOCAL];
     }
-    if (
-      opts &&
-      opts.includeApiKey &&
-      typeof key[AI_KEY_LOCAL] === "string" &&
-      key[AI_KEY_LOCAL] !== ""
-    ) {
-      local[AI_KEY_LOCAL] = key[AI_KEY_LOCAL];
+    if (excl[EXCLUSIONS_LOCAL] !== undefined) {
+      local[EXCLUSIONS_LOCAL] = excl[EXCLUSIONS_LOCAL];
+    }
+    if (tmpl[TEMPLATES_LOCAL] !== undefined) {
+      local[TEMPLATES_LOCAL] = tmpl[TEMPLATES_LOCAL];
+    }
+    if (prof[PROFILES_LOCAL] !== undefined) {
+      local[PROFILES_LOCAL] = prof[PROFILES_LOCAL];
+    }
+    if (opts && opts.includeApiKey) {
+      if (Array.isArray(keys[AI_KEYS_LOCAL]) && keys[AI_KEYS_LOCAL].length) {
+        local[AI_KEYS_LOCAL] = keys[AI_KEYS_LOCAL];
+        if (active[AI_ACTIVE_KEY_LOCAL] !== undefined) {
+          local[AI_ACTIVE_KEY_LOCAL] = active[AI_ACTIVE_KEY_LOCAL];
+        }
+      }
+      if (typeof key[AI_KEY_LOCAL] === "string" && key[AI_KEY_LOCAL] !== "") {
+        local[AI_KEY_LOCAL] = key[AI_KEY_LOCAL];
+      }
     }
     return { data: data, local: local };
   }
@@ -1763,7 +2457,9 @@ async function fillPageAction(api) {
   // redacted export (no API key) leaves the existing stored key untouched.
   async function importData(api, exported) {
     exported = exported || {};
-    await api.setModuleData(MODULE_ID, exported.data || {});
+    // writeFormData strips profiles from the sync payload and writes them
+    // to storage.local, so old exports that carry profiles in data work too.
+    await writeFormData(api, exported.data || {});
     await api.setModuleActive(MODULE_ID, Boolean(exported.active !== false));
     const local = exported.local;
     if (local && typeof local === "object") {
@@ -1771,16 +2467,101 @@ async function fillPageAction(api) {
       if (local[AI_CONTEXT_LOCAL] !== undefined) {
         writes[AI_CONTEXT_LOCAL] = local[AI_CONTEXT_LOCAL];
       }
+      if (local[AI_KEYS_LOCAL] !== undefined) {
+        writes[AI_KEYS_LOCAL] = local[AI_KEYS_LOCAL];
+      }
+      if (local[AI_ACTIVE_KEY_LOCAL] !== undefined) {
+        writes[AI_ACTIVE_KEY_LOCAL] = local[AI_ACTIVE_KEY_LOCAL];
+      }
       if (local[AI_KEY_LOCAL] !== undefined) {
         writes[AI_KEY_LOCAL] = local[AI_KEY_LOCAL];
       }
       if (local[APPLICATIONS_LOCAL] !== undefined) {
         writes[APPLICATIONS_LOCAL] = local[APPLICATIONS_LOCAL];
       }
+      if (local[EXCLUSIONS_LOCAL] !== undefined) {
+        writes[EXCLUSIONS_LOCAL] = local[EXCLUSIONS_LOCAL];
+      }
+      if (local[TEMPLATES_LOCAL] !== undefined) {
+        writes[TEMPLATES_LOCAL] = local[TEMPLATES_LOCAL];
+      }
+      if (local[PROFILES_LOCAL] !== undefined) {
+        writes[PROFILES_LOCAL] = local[PROFILES_LOCAL];
+      }
       if (Object.keys(writes).length) {
         await browser.storage.local.set(writes);
       }
     }
+  }
+
+  // Build the small part of moduleApi needed by the command handler when this
+  // event page was recreated for the command before context menus were rebuilt.
+  // The fallback mirrors core/background.js's notify payload and uses the
+  // already-loaded shared storage module; no new permission or core wiring is
+  // needed.
+  function getCommandApi() {
+    if (moduleApiRef) return moduleApiRef;
+    const storage = window.jobAppToolkit && window.jobAppToolkit.storage;
+    return {
+      getModuleData:
+        storage && typeof storage.getModuleData === "function"
+          ? storage.getModuleData
+          : function () { return Promise.resolve({ active: true }); },
+      setModuleData:
+        storage && typeof storage.setModuleData === "function"
+          ? storage.setModuleData
+          : function () { return Promise.resolve(); },
+      isModuleActive:
+        storage && typeof storage.isModuleActive === "function"
+          ? storage.isModuleActive
+          : function () { return Promise.resolve(true); },
+      notify: function (tabId, title, message, action, moduleId) {
+        if (typeof tabId !== "number") return Promise.resolve(false);
+        const payload = {
+          type: "jtk:showToast",
+          title: title || "",
+          message: message || "",
+          action: action || null,
+          module: moduleId || ""
+        };
+        try {
+          return Promise.resolve(browser.tabs.sendMessage(tabId, payload)).then(
+            function () { return true; },
+            function () { return false; }
+          );
+        } catch (err) {
+          return Promise.resolve(false);
+        }
+      }
+    };
+  }
+
+  async function handleCommand(command) {
+    if (command !== COMMANDS.fillFieldOnce) return;
+    const api = getCommandApi();
+    if (typeof api.isModuleActive === "function" && !(await api.isModuleActive(MODULE_ID))) {
+      return;
+    }
+    const tab = await getCommandWebTab();
+    if (!tab) {
+      console.warn("[Form Filler] command without an active web tab");
+      return;
+    }
+    // No targetElementId is intentional: each frame's content script uses its
+    // own document.activeElement, so the focused same-origin frame can win.
+    await fillFieldOnceAction(tab, api, undefined, undefined, true);
+  }
+
+  if (
+    browser.commands &&
+    browser.commands.onCommand &&
+    typeof browser.commands.onCommand.addListener === "function"
+  ) {
+    browser.commands.onCommand.addListener(function (command) {
+      return handleCommand(command).catch(function (err) {
+        console.error("[Form Filler] command handler failed", err);
+      });
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1818,9 +2599,12 @@ async function fillPageAction(api) {
     buildRetryMessages: buildRetryMessages,
     timeouts: aiTimeouts,
     htmlToPlainText: htmlToPlainText,
+    decodeHtmlEntities: decodeHtmlEntities,
+    greenhouseContentToPlainText: greenhouseContentToPlainText,
     parseJobPostingFromHtml: parseJobPostingFromHtml,
     findJobDescAdapter: findJobDescAdapter,
     resolveJobDescription: resolveJobDescription,
+    resolveGreenhouseJobDescription: resolveGreenhouseJobDescription,
     jobDescCache: jobDescCache,
     JOB_DESC_MAX_CHARS: JOB_DESC_MAX_CHARS,
     JOB_DESC_ADAPTERS: JOB_DESC_ADAPTERS,

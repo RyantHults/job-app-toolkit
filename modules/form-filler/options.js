@@ -3,7 +3,12 @@
 
   const MODULE_ID = "form-filler";
   const AI_KEY_LOCAL = "jtk-form-filler-ai-key";
+  const AI_KEYS_LOCAL = "jtk-form-filler-ai-keys";
+  const AI_ACTIVE_KEY_LOCAL = "jtk-form-filler-ai-active-key";
   const AI_CONTEXT_LOCAL = "jtk-form-filler-ai-context";
+  // Profiles are offloaded from storage.sync to storage.local (unlimited) to
+  // stay under the 100 KiB sync quota. Same key as background.js/content.js.
+  const PROFILES_LOCAL = "jtk-form-filler-profiles";
   // Keep in sync with the DEFAULT_AI_INSTRUCTIONS constant in
   // modules/form-filler/background.js — the background uses it as the system
   // prompt fallback when the user has not entered custom instructions.
@@ -36,10 +41,12 @@
   const aiModel = document.getElementById("ai-model");
   const aiInstructions = document.getElementById("ai-instructions");
   const aiInstructionsReset = document.getElementById("ai-instructions-reset");
-  const aiKeyInput = document.getElementById("ai-key");
+  const aiKeyList = document.getElementById("ai-key-list");
+  const aiKeyName = document.getElementById("ai-key-name");
+  const aiKeyValue = document.getElementById("ai-key-value");
+  const aiKeyAddBtn = document.getElementById("ai-key-add-btn");
   const aiKeyStatus = document.getElementById("ai-key-status");
   const aiSave = document.getElementById("ai-save");
-  const aiKeyClear = document.getElementById("ai-key-clear");
   const aiContextAdd = document.getElementById("ai-context-add");
   const aiContextList = document.getElementById("ai-context-list");
   const aiContextEditor = document.getElementById("ai-context-editor");
@@ -51,7 +58,6 @@
   const debugToggle = document.getElementById("debug-toggle");
 
   let data = { active: true, profiles: {}, activeProfile: null, whitelist: [], aiContext: [] };
-  let aiKey = "";
   let editingIndex = -1;
   let editingIsNew = false;
 
@@ -62,6 +68,21 @@
 
   async function loadData() {
     data = await storage.getModuleData(MODULE_ID);
+    // Profiles live in storage.local (offloaded from sync for quota). Prefer
+    // the local copy; a non-empty sync copy is pre-migration legacy — move it
+    // to local on first load and strip it from sync.
+    try {
+      const prof = await browser.storage.local.get(PROFILES_LOCAL);
+      if (prof[PROFILES_LOCAL] !== undefined) {
+        data.profiles = prof[PROFILES_LOCAL];
+      } else if (data.profiles && Object.keys(data.profiles).length > 0) {
+        await browser.storage.local.set({ [PROFILES_LOCAL]: data.profiles });
+        const verify = await browser.storage.local.get(PROFILES_LOCAL);
+        if (verify[PROFILES_LOCAL] && Object.keys(verify[PROFILES_LOCAL]).length > 0) {
+          await storage.setModuleData(MODULE_ID, { profiles: undefined });
+        }
+      }
+    } catch (e) { /* fall back to whatever module data carried */ }
     if (!data.profiles || typeof data.profiles !== "object") {
       data.profiles = {};
     }
@@ -105,23 +126,34 @@
       typeof data.aiInstructions === "string" && data.aiInstructions.trim()
         ? data.aiInstructions
         : DEFAULT_AI_INSTRUCTIONS;
-    const kr = await browser.storage.local.get(AI_KEY_LOCAL);
-    if (kr[AI_KEY_LOCAL]) {
-      aiKey = kr[AI_KEY_LOCAL];
-      aiKeyInput.placeholder = "saved \u2014 leave blank to keep";
-      aiKeyStatus.textContent = "API key saved in this browser.";
-      aiKeyClear.hidden = false;
+    // Migration: old single key → new multi-key list
+    const oldKey = await browser.storage.local.get(AI_KEY_LOCAL);
+    const keysData = await browser.storage.local.get(AI_KEYS_LOCAL);
+    let aiKeys = Array.isArray(keysData[AI_KEYS_LOCAL]) ? keysData[AI_KEYS_LOCAL] : [];
+    if (oldKey[AI_KEY_LOCAL] && !aiKeys.length) {
+      const migrated = { id: crypto.randomUUID(), name: "Default", key: oldKey[AI_KEY_LOCAL] };
+      aiKeys = [migrated];
+      await browser.storage.local.set({ [AI_KEYS_LOCAL]: aiKeys });
+      await browser.storage.local.set({ [AI_ACTIVE_KEY_LOCAL]: migrated.id });
     }
+    await browser.storage.local.remove(AI_KEY_LOCAL); // clean up legacy
+
+    const activeData = await browser.storage.local.get(AI_ACTIVE_KEY_LOCAL);
+    const activeKeyId = activeData[AI_ACTIVE_KEY_LOCAL] || (aiKeys.length ? aiKeys[0].id : null);
+    renderKeyList(aiKeys, activeKeyId);
     activeToggle.checked = data.active === true;
     debugToggle.checked = data.debug === true;
   }
 
   // Entries are persisted to storage.local FIRST (they are the bulky part the
   // sync quota can't hold), then the rest of the module data goes to sync.
+  // Profiles also live in storage.local; `profiles: undefined` tells
+  // setModuleData to delete any stale sync copy.
   async function saveData() {
     await browser.storage.local.set({ [AI_CONTEXT_LOCAL]: data.aiContext });
+    await browser.storage.local.set({ [PROFILES_LOCAL]: data.profiles || {} });
     return storage.setModuleData(MODULE_ID, {
-      profiles: data.profiles,
+      profiles: undefined,
       activeProfile: data.activeProfile,
       whitelist: data.whitelist,
       aiEndpoint: data.aiEndpoint,
@@ -322,6 +354,32 @@
       nameSpan.textContent = label;
       nameSpan.title = label;
 
+      const typeSelect = document.createElement("select");
+      typeSelect.className = "field-type-select";
+      typeSelect.title = "Field type (used during matching)";
+      const entryType = isObj && entry.type ? entry.type : "";
+      ["", "text", "textarea", "checkbox", "radio", "select"].forEach(function (t) {
+        const opt = document.createElement("option");
+        opt.value = t;
+        opt.textContent = t || "Any";
+        opt.selected = t === entryType;
+        typeSelect.appendChild(opt);
+      });
+      typeSelect.addEventListener("change", async function () {
+        const key = li.dataset.key;
+        const profile = currentProfile();
+        if (!profile || !profile.fields || !profile.fields[key]) return;
+        const field = profile.fields[key];
+        if (typeof field === "string") {
+          // Legacy string entry — promote to the { value, label, type } format.
+          profile.fields[key] = { value: field, label: key, type: typeSelect.value };
+        } else {
+          field.type = typeSelect.value;
+        }
+        await saveData();
+        render();
+      });
+
       const valueSpan = document.createElement("span");
       valueSpan.className = "field-value";
       const valueText = displayValue(value);
@@ -341,6 +399,7 @@
       editBtn.addEventListener("click", () => editFieldLabel(key));
 
       li.appendChild(nameSpan);
+      li.appendChild(typeSelect);
       li.appendChild(valueSpan);
       li.appendChild(editBtn);
       li.appendChild(del);
@@ -641,21 +700,59 @@
     ui.setStatus("Default instructions restored \u2014 click Save to keep.");
   });
 
+  function renderKeyList(keys, activeId) {
+    aiKeyList.innerHTML = "";
+    keys.forEach(function (k) {
+      const li = document.createElement("li");
+      li.className = "key-item" + (k.id === activeId ? " active" : "");
+
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "ai-key-select";
+      radio.checked = k.id === activeId;
+      radio.addEventListener("change", async function () {
+        await browser.storage.local.set({ [AI_ACTIVE_KEY_LOCAL]: k.id });
+        renderKeyList(keys, k.id);
+      });
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "key-name";
+      nameSpan.textContent = k.name || "(unnamed)";
+
+      const tailSpan = document.createElement("span");
+      tailSpan.className = "key-tail";
+      tailSpan.textContent = "\u2026 " + (k.key ? k.key.slice(-4) : "????");
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "btn";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", async function () {
+        const remaining = keys.filter(function (x) { return x.id !== k.id; });
+        let nextActive = activeId;
+        if (nextActive === k.id) {
+          nextActive = remaining.length ? remaining[0].id : null;
+        }
+        await browser.storage.local.set({ [AI_KEYS_LOCAL]: remaining });
+        await browser.storage.local.set({ [AI_ACTIVE_KEY_LOCAL]: nextActive });
+        renderKeyList(remaining, nextActive);
+        ui.setStatus("Key removed.");
+      });
+
+      li.appendChild(radio);
+      li.appendChild(nameSpan);
+      li.appendChild(tailSpan);
+      li.appendChild(removeBtn);
+      aiKeyList.appendChild(li);
+    });
+  }
+
   aiSave.addEventListener("click", async () => {
     const endpoint = aiEndpoint.value.trim();
     const model = aiModel.value.trim();
     if (!endpoint || !model) {
       ui.setStatus("Enter an endpoint and model.");
       return;
-    }
-    const key = aiKeyInput.value.trim();
-    if (key) {
-      await browser.storage.local.set({ [AI_KEY_LOCAL]: key });
-      aiKey = key;
-      aiKeyInput.value = "";
-      aiKeyInput.placeholder = "saved \u2014 leave blank to keep";
-      aiKeyStatus.textContent = "API key saved in this browser.";
-      aiKeyClear.hidden = false;
     }
     try {
       data.aiEndpoint = endpoint;
@@ -669,15 +766,27 @@
     }
   });
 
-  // Remove the saved key from local storage; the endpoint/model stay.
-  aiKeyClear.addEventListener("click", async () => {
-    await browser.storage.local.remove(AI_KEY_LOCAL);
-    aiKey = "";
-    aiKeyInput.value = "";
-    aiKeyInput.placeholder = "sk-\u2026";
-    aiKeyStatus.textContent = "";
-    aiKeyClear.hidden = true;
-    ui.setStatus("API key removed.");
+  // Add a named API key to the list; the first key is auto-selected.
+  aiKeyAddBtn.addEventListener("click", async function () {
+    const name = aiKeyName.value.trim();
+    const key = aiKeyValue.value.trim();
+    if (!key) { ui.setStatus("Enter an API key."); return; }
+    const id = crypto.randomUUID();
+    const entry = { id: id, name: name || "Unnamed", key: key };
+    const keysData = await browser.storage.local.get(AI_KEYS_LOCAL);
+    const keys = Array.isArray(keysData[AI_KEYS_LOCAL]) ? keysData[AI_KEYS_LOCAL] : [];
+    keys.push(entry);
+    await browser.storage.local.set({ [AI_KEYS_LOCAL]: keys });
+    // Auto-select if it's the first key
+    const activeData = await browser.storage.local.get(AI_ACTIVE_KEY_LOCAL);
+    if (!activeData[AI_ACTIVE_KEY_LOCAL]) {
+      await browser.storage.local.set({ [AI_ACTIVE_KEY_LOCAL]: id });
+    }
+    const newActive = (await browser.storage.local.get(AI_ACTIVE_KEY_LOCAL))[AI_ACTIVE_KEY_LOCAL] || id;
+    renderKeyList(keys, newActive);
+    aiKeyName.value = "";
+    aiKeyValue.value = "";
+    ui.setStatus("Key added.");
   });
 
   // ---- AI background -----------------------------------------------------------
@@ -770,11 +879,193 @@
     renderAIContext();
   });
 
+  // ---- Correction history -----------------------------------------------------
+
+  // Marked-incorrect fields (exclusions) are global and stored in
+  // browser.storage.local by the background; this section only shows the
+  // count and offers a clear-all. The section is built here (not in
+  // options.html) so the feature stays self-contained.
+  const exclusionsSection = document.createElement("section");
+  exclusionsSection.className = "section";
+  exclusionsSection.setAttribute("aria-label", "Correction history");
+
+  const exclusionsHeading = document.createElement("h2");
+  exclusionsHeading.textContent = "Correction history";
+  exclusionsSection.appendChild(exclusionsHeading);
+
+  const exclusionsCount = document.createElement("p");
+  exclusionsCount.className = "subtitle";
+  exclusionsSection.appendChild(exclusionsCount);
+
+  const exclusionsClearBtn = document.createElement("button");
+  exclusionsClearBtn.type = "button";
+  exclusionsClearBtn.className = "btn";
+  exclusionsClearBtn.textContent = "Clear all";
+  exclusionsSection.appendChild(exclusionsClearBtn);
+
+  const statusLine = document.getElementById("status");
+  if (statusLine && statusLine.parentNode) {
+    statusLine.parentNode.insertBefore(exclusionsSection, statusLine);
+  } else {
+    document.body.appendChild(exclusionsSection);
+  }
+
+  function renderExclusionsCount(count) {
+    const n = typeof count === "number" ? count : 0;
+    exclusionsCount.textContent =
+      n +
+      " marked-incorrect field" +
+      (n === 1 ? "" : "s") +
+      " (corrections are global \u2014 they apply on every site)";
+  }
+
+  async function loadExclusions() {
+    try {
+      const res = await browser.runtime.sendMessage({ type: "form-filler:getExclusions" });
+      if (res && res.ok && typeof res.count === "number") {
+        renderExclusionsCount(res.count);
+      }
+    } catch (err) {
+      // Background unavailable; leave the section empty rather than throw.
+    }
+  }
+
+  exclusionsClearBtn.addEventListener("click", async () => {
+    if (!(await ui.showConfirm("Clear all marked-incorrect fields?"))) return;
+    try {
+      const res = await browser.runtime.sendMessage({ type: "form-filler:clearExclusions" });
+      if (res && res.ok) {
+        renderExclusionsCount(0);
+        ui.setStatus("Correction history cleared.");
+      } else {
+        ui.setStatus((res && res.error) || "Could not clear correction history.");
+      }
+    } catch (err) {
+      ui.setStatus("Could not clear correction history.");
+    }
+  });
+
+  // ---- Page templates ---------------------------------------------------------
+
+  // Saved page templates live in browser.storage.local (managed by the
+  // background); this section lists them with a delete button. Built here
+  // (not in options.html) so the feature stays self-contained, same as the
+  // correction-history section above.
+  const templatesSection = document.createElement("section");
+  templatesSection.className = "section";
+  templatesSection.setAttribute("aria-label", "Page templates");
+
+  const templatesHeading = document.createElement("h2");
+  templatesHeading.textContent = "Page templates";
+  templatesSection.appendChild(templatesHeading);
+
+  const templatesSubtitle = document.createElement("p");
+  templatesSubtitle.className = "subtitle";
+  templatesSubtitle.textContent =
+    "Saved page templates fill all fields when the page's field shape matches.";
+  templatesSection.appendChild(templatesSubtitle);
+
+  const templatesList = document.createElement("ul");
+  templatesList.id = "templates-list";
+  templatesSection.appendChild(templatesList);
+
+  // Insert after the correction-history section (it sits right before the
+  // status line).
+  if (exclusionsSection && exclusionsSection.parentNode) {
+    exclusionsSection.parentNode.insertBefore(templatesSection, exclusionsSection.nextSibling);
+  } else if (statusLine && statusLine.parentNode) {
+    statusLine.parentNode.insertBefore(templatesSection, statusLine);
+  } else {
+    document.body.appendChild(templatesSection);
+  }
+
+  // Templates as rendered: { "<id>": { name, shape, fields, savedUrl, createdAt } }.
+  let templatesData = null;
+
+  function renderTemplates(templates) {
+    templatesData = templates || {};
+    templatesList.textContent = "";
+    const list = Object.keys(templatesData).map((id) => ({
+      id: id,
+      tpl: templatesData[id]
+    }));
+    list.sort((a, b) => (b.tpl.createdAt || 0) - (a.tpl.createdAt || 0));
+    if (list.length === 0) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "No templates saved.";
+      templatesList.appendChild(li);
+      return;
+    }
+    for (const entry of list) {
+      const li = document.createElement("li");
+      li.className = "template-row";
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "template-name";
+      nameSpan.textContent = (entry.tpl.name && entry.tpl.name.trim()) || "Untitled template";
+      nameSpan.title = entry.tpl.name || "";
+
+      const urlText = typeof entry.tpl.savedUrl === "string" ? entry.tpl.savedUrl : "";
+      const urlSpan = document.createElement("span");
+      urlSpan.className = "template-url";
+      urlSpan.textContent = urlText.length > 60 ? urlText.slice(0, 60) + "\u2026" : urlText;
+      urlSpan.title = urlText;
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn-sm template-del";
+      del.dataset.templateId = entry.id;
+      del.textContent = "Delete";
+
+      li.appendChild(nameSpan);
+      li.appendChild(urlSpan);
+      li.appendChild(del);
+      templatesList.appendChild(li);
+    }
+  }
+
+  async function loadTemplates() {
+    try {
+      const res = await browser.runtime.sendMessage({ type: "form-filler:getTemplates" });
+      if (res && res.ok) {
+        renderTemplates(res.templates);
+      }
+    } catch (err) {
+      // Background unavailable; leave the section empty rather than throw.
+    }
+  }
+
+  // Event delegation so Delete buttons keep working after re-renders.
+  templatesList.addEventListener("click", async (event) => {
+    const btn = event.target.closest(".template-del");
+    if (!btn || !btn.dataset || !btn.dataset.templateId) return;
+    const tpl = templatesData[btn.dataset.templateId] || {};
+    const name = (tpl.name && tpl.name.trim()) || "template";
+    if (!(await ui.showConfirm('Delete template "' + name + '"?'))) return;
+    try {
+      const res = await browser.runtime.sendMessage({
+        type: "form-filler:deleteTemplate",
+        templateId: btn.dataset.templateId
+      });
+      if (res && res.ok) {
+        await loadTemplates();
+        ui.setStatus("Template deleted.");
+      } else {
+        ui.setStatus((res && res.error) || "Could not delete template.");
+      }
+    } catch (err) {
+      ui.setStatus("Could not delete template.");
+    }
+  });
+
   // ---- Init -------------------------------------------------------------------
 
   loadData().then(() => {
     fieldSearch.value = "";
     filterFields();
     render();
+    loadExclusions();
+    loadTemplates();
   }).catch(handleError);
 })();

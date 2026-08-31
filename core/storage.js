@@ -49,10 +49,13 @@
     await browser.storage.sync.set({ [KEY]: data });
   }
 
-  // The whole module object: { active, ...modulePayload }.
+  // The whole module object: { active, ...modulePayload }. Returned as a
+  // detached copy so callers can hold it across their own setModuleData
+  // writes without aliasing the store (a later delete/merge must never
+  // mutate data a caller is still reading).
   async function getModuleData(id) {
     const store = await getAll();
-    return moduleData(store, id);
+    return JSON.parse(JSON.stringify(moduleData(store, id)));
   }
 
   async function isModuleActive(id) {
@@ -69,10 +72,17 @@
   }
 
   // Merge a payload into the module's data (preserves the active flag).
+  // Keys with an `undefined` value are deleted — this lets callers offload
+  // a key to storage.local while cleaning up the sync blob.
   async function setModuleData(id, data) {
     const store = await getAll();
-    const merged = Object.assign(moduleData(store, id), data);
-    store.modules[id] = merged;
+    const mod = moduleData(store, id);
+    const keys = Object.keys(data);
+    for (let i = 0; i < keys.length; i++) {
+      if (data[keys[i]] === undefined) delete mod[keys[i]];
+      else mod[keys[i]] = data[keys[i]];
+    }
+    store.modules[id] = mod;
     await setAll(store);
   }
 

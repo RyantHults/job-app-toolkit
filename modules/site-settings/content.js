@@ -50,8 +50,12 @@
 
   // Job card containers on the LinkedIn jobs search page. Kept defensive and
   // centralized: LinkedIn reworks its markup often, and this list is the first
-  // thing to revisit when a card stops being found.
+  // thing to revisit when a card stops being found. The 2025+ jobs-search
+  // rework dropped the old hooks: cards are now divs carrying
+  // componentkey="job-card-component-ref-<id>" (the same key also sits on a
+  // nested content div; findJobCards keeps only the outermost match per card).
   const CARD_SELECTORS = [
+    '[componentkey^="job-card-component-ref-"]',
     "li.job-card-container",
     "[data-job-id]",
     ".jobs-search-results-list li"
@@ -119,6 +123,25 @@
       .replace(/\s+/g, " ");
   }
 
+  // The 2025+ jobs-search rework also hashed away every company/title class
+  // hook, so the adapter resolves those rows positionally: the card is a set
+  // of <p> rows in a fixed order (title, company, location, then meta), with
+  // only short variant rows (Promoted, Posted …, separators) interspersed.
+  const CARD_META_ROW = /^(promoted|new|sponsored|easy apply|top applicant|early applicant|be an early applicant|you'?d be a(?: top)? applicant|posted .+ ago|·+)$/i;
+
+  // Text-bearing <p> rows of a card in document order, with the short meta
+  // rows filtered out so title/company can be picked by position on sponsored
+  // or variant cards too.
+  function cardTextRows(card) {
+    return Array.from(card.querySelectorAll("p"))
+      .map(function (p) {
+        return { p: p, text: titleText(p) };
+      })
+      .filter(function (r) {
+        return r.text && !CARD_META_ROW.test(r.text);
+      });
+  }
+
   const linkedinAdapter = {
     siteId: "linkedin",
     isTargetPage: function () {
@@ -133,6 +156,9 @@
         const nodes = scope.querySelectorAll(sel);
         for (const node of nodes) {
           if (seen.has(node)) continue;
+          // The new markup carries componentkey on BOTH the card root and a
+          // nested content div; keep only the outermost match per card.
+          if (cards.some((c) => c.contains(node))) continue;
           seen.add(node);
           cards.push(node);
         }
@@ -150,6 +176,12 @@
         // block/highlight buttons.
         if (text && text.length < 200) return { el: el, name: text };
       }
+      // New hashed-class layout: company is the second text row (after title).
+      const rows = cardTextRows(card);
+      if (rows.length < 2) return null;
+      const el = rows[1].p;
+      const text = companyText(el);
+      if (text && text.length < 200) return { el: el, name: text };
       return null;
     },
     titleFromCard: function (card) {
@@ -159,6 +191,16 @@
         const text = titleText(el);
         if (text) return { el: el, text: text };
       }
+      // New hashed-class layout: title is the first text row; the visible text
+      // sits in a span child (the aria-hidden duplicate span is skipped).
+      const rows = cardTextRows(card);
+      if (!rows.length) return null;
+      const el = rows[0].p;
+      const span = Array.from(el.querySelectorAll(":scope > span")).find(function (s) {
+        return String(s.textContent || "").trim();
+      });
+      const text = titleText(span || el);
+      if (text) return { el: el, text: text };
       return null;
     }
   };
@@ -1150,7 +1192,14 @@
     if (existing) existing.remove();
     const wrapper = createFilterButton(title.text);
     const parent = title.el.parentNode;
-    if (parent) parent.insertBefore(wrapper, title.el.nextSibling);
+    if (!parent) return;
+    if (title.el.tagName === "P") {
+      // New-markup titles are block <p>s: a sibling wrapper would land on its
+      // own line, so flow it inline as the <p>'s last child instead.
+      title.el.appendChild(wrapper);
+    } else {
+      parent.insertBefore(wrapper, title.el.nextSibling);
+    }
   }
 
   // Single shared modal, created lazily on first open and removed on close, so

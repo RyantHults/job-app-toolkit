@@ -208,6 +208,16 @@ h2 {
   flex-shrink: 0;
 }
 
+.field-type-select {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 4px;
+  border: 1px solid #d1d5db;
+  border-radius: 3px;
+  background: #f9fafb;
+  color: #374151;
+}
+
 .status {
   margin: 0;
   font-style: italic;
@@ -279,4 +289,55 @@ h2 {
 
 .btn-secondary:hover {
   background: #f3f4f6;
+}
+
+.key-list {
+  list-style: none;
+  margin: 0 0 8px 0;
+  padding: 0;
+}
+.key-list:empty::after {
+  content: "No API keys saved.";
+  font-size: 12px;
+  color: #9ca3af;
+}
+.key-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.key-item.active {
+  background: #f3f4f6;
+}
+.key-item input[type="radio"] {
+  margin: 0;
+}
+.key-name {
+  font-weight: 500;
+  min-width: 80px;
+}
+.key-tail {
+  color: #6b7280;
+  font-family: monospace;
+  font-size: 12px;
+}
+.key-item .btn {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.key-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.key-name-input {
+  width: 160px;
+}
+.key-value-input {
+  flex: 1;
 }
