@@ -5,9 +5,20 @@
 
   const list = document.getElementById("applications-list");
   const sortSelect = document.getElementById("sort-select");
+  const searchInput = document.getElementById("search-input");
+
+  // Multi-field edit modal.
+  const editOverlay = document.getElementById("edit-overlay");
+  const editCompany = document.getElementById("edit-company");
+  const editTitle = document.getElementById("edit-title-input");
+  const editUrl = document.getElementById("edit-url");
+  const editSave = document.getElementById("edit-save");
+  const editCancel = document.getElementById("edit-cancel");
+  let editApp = null; // the application currently being edited, if any
 
   let applications = [];
   let stages = [];
+  let searchQuery = "";
 
   function handleError(err) {
     console.error("Application History error:", err);
@@ -16,6 +27,35 @@
 
   function errorText(res, fallback) {
     return (res && res.error) || fallback;
+  }
+
+  // Open the edit modal pre-filled with the application's current text fields.
+  // Returns a promise resolving to the entered { title, company, url } object,
+  // or null when the user cancels/clears. The caller persists via
+  // form-filler:updateApplication.
+  function openEditModal(app, callback) {
+    editApp = app;
+    editCompany.value = app.company ? String(app.company) : "";
+    editTitle.value = app.title ? String(app.title) : "";
+    editUrl.value = app.url ? String(app.url) : "";
+    editOverlay.hidden = false;
+    editCompany.focus();
+    editSave.onclick = () => {
+      const title = editTitle.value.trim();
+      const company = editCompany.value.trim();
+      const url = editUrl.value.trim();
+      editOverlay.hidden = true;
+      editApp = null;
+      callback({ title: title, company: company, url: url });
+    };
+    editCancel.onclick = closeEditModal;
+  }
+
+  function closeEditModal() {
+    if (!editOverlay.hidden) editOverlay.hidden = true;
+    editApp = null;
+    editSave.onclick = null;
+    editCancel.onclick = null;
   }
 
   async function load() {
@@ -64,8 +104,24 @@
     });
   }
 
-  function sortApplications() {
-    const sorted = applications.slice();
+  // Case-insensitive match against the job title, company name, and URL. A
+  // blank query matches everything; otherwise the query must be a substring of
+  // any of the three fields.
+  function matchesSearch(app) {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const title = app.title ? String(app.title).toLowerCase() : "";
+    const company = app.company ? String(app.company).toLowerCase() : "";
+    const url = app.url ? String(app.url).toLowerCase() : "";
+    return (
+      title.indexOf(q) !== -1 ||
+      company.indexOf(q) !== -1 ||
+      url.indexOf(q) !== -1
+    );
+  }
+
+  function sortApplications(source) {
+    const sorted = (source || applications).slice();
     if (sortSelect.value === "company") {
       sorted.sort((a, b) => {
         const ca = (a.company || "").trim().toLowerCase();
@@ -94,14 +150,16 @@
   }
 
   function render() {
-    const sorted = sortApplications();
+    const filtered = applications.filter(matchesSearch);
+    const sorted = sortApplications(filtered);
     list.textContent = "";
 
     if (!sorted.length) {
       const li = document.createElement("li");
       li.className = "empty";
-      li.textContent =
-        "No applications logged yet. Submitting a form on a whitelisted job board will record it here.";
+      li.textContent = applications.length
+        ? 'No applications match "' + searchQuery.trim() + '".'
+        : "No applications logged yet. Submitting a form on a whitelisted job board will record it here.";
       list.appendChild(li);
       return;
     }
@@ -186,30 +244,30 @@
     companyEdit.className = "btn btn-sm";
     companyEdit.textContent = "Edit";
     companyEdit.title = "Edit company name";
-    companyEdit.addEventListener("click", async () => {
-      const raw = await ui.showPrompt(
-        "Company name:",
-        app.company ? String(app.company) : ""
-      );
-      if (raw === null) return; // cancel: do nothing
-      const company = String(raw).trim();
-      try {
-        const res = await browser.runtime.sendMessage({
-          type: "form-filler:setApplicationCompany",
-          id: app.id,
-          company: company
-        });
-        if (!res || !res.ok) {
-          ui.setStatus(errorText(res, "Could not update the company."));
-          load(); // re-render restores the prior label
-          return;
+    companyEdit.addEventListener("click", () => {
+      openEditModal(app, async (values) => {
+        // values is { title, company, url }; always send all three so any
+        // cleared field persists too.
+        try {
+          const res = await browser.runtime.sendMessage({
+            type: "form-filler:updateApplication",
+            id: app.id,
+            title: values.title,
+            company: values.company,
+            url: values.url
+          });
+          if (!res || !res.ok) {
+            ui.setStatus(errorText(res, "Could not update the application."));
+            load(); // re-render restores the prior values
+            return;
+          }
+          ui.setStatus("Application updated.");
+          load();
+        } catch (err) {
+          handleError(err);
+          load();
         }
-        ui.setStatus("Company updated.");
-        load();
-      } catch (err) {
-        handleError(err);
-        load();
-      }
+      });
     });
     buttons.appendChild(companyEdit);
 
@@ -262,6 +320,27 @@
   }
 
   sortSelect.addEventListener("change", render);
+  searchInput.addEventListener("input", () => {
+    searchQuery = searchInput.value;
+    render();
+  });
+
+  // Backdrop click closes the edit modal; Escape cancels it.
+  editOverlay.addEventListener("click", (e) => {
+    if (e.target === editOverlay) closeEditModal();
+  });
+  // Enter in any field saves; Escape cancels.
+  for (const input of [editCompany, editTitle, editUrl]) {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && editApp && editSave.onclick) {
+        e.preventDefault();
+        editSave.onclick();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeEditModal();
+      }
+    });
+  }
 
   load();
 })();

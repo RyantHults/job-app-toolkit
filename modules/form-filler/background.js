@@ -1823,18 +1823,46 @@ function skippedText(res) {
     return { ok: true };
   }
 
-  // Set an entry's company label (a user correction when extraction grabbed
-  // the wrong name). Empty is allowed — it clears the label so the history
-  // row falls back to the job title / "Unknown company".
-  async function setApplicationCompanyAction(message) {
+  // Update an entry's text fields (user corrections when extraction grabbed the
+  // wrong title/company, or the URL needs fixing). Only the fields present in
+  // the message are changed; empty strings are valid and clear that field (the
+  // history falls back to the job title / "Unknown company" for an empty
+  // company). A no-op when nothing needs to change.
+  async function updateApplicationAction(message) {
     const id = message.id;
-    const company = typeof message.company === "string" ? message.company.trim() : "";
     const list = await readApplications();
     const entry = list.find((e) => e && e.id === id);
-    if (entry && entry.company !== company) {
-      entry.company = company;
-      await writeApplications(list);
+    if (!entry) return { ok: true };
+    let changed = false;
+    if ("company" in message) {
+      const company = typeof message.company === "string" ? message.company.trim() : "";
+      if (entry.company !== company) {
+        entry.company = company;
+        changed = true;
+      }
     }
+    if ("title" in message) {
+      const title = typeof message.title === "string" ? message.title.trim() : "";
+      if (entry.title !== title) {
+        entry.title = title;
+        changed = true;
+      }
+    }
+    if ("url" in message) {
+      let url = typeof message.url === "string" ? message.url.trim() : "";
+      if (url !== "") {
+        try {
+          url = new URL(url).toString();
+        } catch (err) {
+          return { ok: false, error: "Enter a valid URL." };
+        }
+      }
+      if (entry.url !== url) {
+        entry.url = url;
+        changed = true;
+      }
+    }
+    if (changed) await writeApplications(list);
     return { ok: true };
   }
 
@@ -2356,8 +2384,8 @@ async function fillPageAction(api) {
     if (message.type === "form-filler:deleteApplication") {
       return deleteApplicationAction(message);
     }
-    if (message.type === "form-filler:setApplicationCompany") {
-      return setApplicationCompanyAction(message);
+    if (message.type === "form-filler:updateApplication") {
+      return updateApplicationAction(message);
     }
     if (message.type === "form-filler:addExclusion") {
       return addExclusionAction(message);

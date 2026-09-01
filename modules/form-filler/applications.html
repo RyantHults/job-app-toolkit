@@ -12,18 +12,42 @@
 
   <!-- Application list -->
   <section class="section" aria-label="Applications">
-    <div class="row">
+    <div class="row controls-row">
       <label for="sort-select" class="label">Sort by</label>
       <select id="sort-select" aria-label="Sort applications">
         <option value="date">Newest first</option>
         <option value="company">Company A–Z</option>
       </select>
+      <input
+        type="search"
+        id="search-input"
+        class="search-input"
+        placeholder="Search title, company, or URL"
+        aria-label="Search applications by title, company, or URL"
+      >
     </div>
     <ul id="applications-list"></ul>
   </section>
 
   <!-- Status / result line -->
   <p id="status" class="status" aria-live="polite"></p>
+
+  <!-- Edit-application modal -->
+  <div id="edit-overlay" class="edit-overlay" hidden>
+    <div class="edit-card" role="dialog" aria-modal="true" aria-labelledby="edit-title">
+      <p id="edit-title" class="edit-heading">Edit application</p>
+      <label class="edit-label" for="edit-company">Company</label>
+      <input id="edit-company" class="edit-input" type="text" autocomplete="off">
+      <label class="edit-label" for="edit-title-input">Job title</label>
+      <input id="edit-title-input" class="edit-input" type="text" autocomplete="off">
+      <label class="edit-label" for="edit-url">URL</label>
+      <input id="edit-url" class="edit-input" type="text" autocomplete="off">
+      <div class="edit-actions">
+        <button type="button" id="edit-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="edit-save" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Inline modal overlay -->
   <div id="modal-overlay" class="modal-overlay" hidden>
