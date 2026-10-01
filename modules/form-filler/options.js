@@ -56,10 +56,18 @@
   const aiContextCancel = document.getElementById("ai-context-cancel");
   const aiContextDelete = document.getElementById("ai-context-delete");
   const debugToggle = document.getElementById("debug-toggle");
+  const fieldEditOverlay = document.getElementById("field-edit-overlay");
+  const fieldEditTitle = document.getElementById("field-edit-title");
+  const fieldEditScalar = document.getElementById("field-edit-scalar");
+  const fieldEditArray = document.getElementById("field-edit-array");
+  const fieldEditSave = document.getElementById("field-edit-save");
+  const fieldEditCancel = document.getElementById("field-edit-cancel");
 
   let data = { active: true, profiles: {}, activeProfile: null, whitelist: [], aiContext: [] };
   let editingIndex = -1;
   let editingIsNew = false;
+  let fieldEditResolve = null;
+  let fieldEditIsArray = false;
 
   // Search event listener
   fieldSearch.addEventListener("input", filterFields);
@@ -220,7 +228,7 @@
   }
 
   function entryNorms(entry, key) {
-    const isObj = entry && typeof entry === "object";
+    const isObj = entry && typeof entry === "object" && !Array.isArray(entry);
     const label = isObj && entry.label ? entry.label : key;
     const keyNorm = normalize(key);
     const labelNorm = normalize(label);
@@ -231,8 +239,9 @@
     // of their options: normalize the JOINED text so "Java,Python" never
     // becomes the single token "javapython". Skip empty arrays (nothing to
     // match) and scalar values (unchanged from legacy behavior).
-    if (isObj && Array.isArray(entry.value) && entry.value.length) {
-      const valueNorm = normalize(entry.value.join(" "));
+    const storedValue = isObj ? entry.value : entry;
+    if (Array.isArray(storedValue) && storedValue.length) {
+      const valueNorm = normalize(storedValue.join(" "));
       if (valueNorm && valueNorm !== keyNorm && valueNorm !== labelNorm) {
         norms.push(valueNorm);
       }
@@ -341,7 +350,7 @@
     }
 
     for (const [key, entry] of entries) {
-      const isObj = entry && typeof entry === "object";
+      const isObj = entry && typeof entry === "object" && !Array.isArray(entry);
       const value = isObj ? entry.value : entry;
       const label = isObj && entry.label ? entry.label : key;
 
@@ -370,7 +379,7 @@
         const profile = currentProfile();
         if (!profile || !profile.fields || !profile.fields[key]) return;
         const field = profile.fields[key];
-        if (typeof field === "string") {
+        if (typeof field === "string" || Array.isArray(field)) {
           // Legacy string entry — promote to the { value, label, type } format.
           profile.fields[key] = { value: field, label: key, type: typeSelect.value };
         } else {
@@ -396,7 +405,8 @@
       editBtn.type = "button";
       editBtn.className = "btn btn-sm field-edit";
       editBtn.textContent = "Edit";
-      editBtn.addEventListener("click", () => editFieldLabel(key));
+      editBtn.setAttribute("aria-label", 'Edit saved field title and value for "' + label + '"');
+      editBtn.addEventListener("click", () => editField(key));
 
       li.appendChild(nameSpan);
       li.appendChild(typeSelect);
@@ -504,28 +514,85 @@
     render();
   }
 
-  async function editFieldLabel(key) {
+  function openFieldEditor(key) {
     const profile = currentProfile();
     if (!profile || !Object.prototype.hasOwnProperty.call(profile.fields, key)) return;
     const entry = profile.fields[key];
-    const isObj = entry && typeof entry === "object";
+    const isObj = entry && typeof entry === "object" && !Array.isArray(entry);
     const currentLabel = isObj && entry.label ? entry.label : key;
+    const currentValue = isObj ? entry.value : entry;
+    fieldEditIsArray = Array.isArray(currentValue);
+    fieldEditResolve = null;
+    fieldEditTitle.value = currentLabel;
+    fieldEditScalar.value = fieldEditIsArray ? "" : String(currentValue == null ? "" : currentValue);
+    fieldEditArray.value = fieldEditIsArray ? currentValue.join("\n") : "";
+    fieldEditScalar.hidden = fieldEditIsArray;
+    fieldEditArray.hidden = !fieldEditIsArray;
+    fieldEditOverlay.querySelector(".modal-message").textContent =
+      'Edit saved field "' + currentLabel + '"';
+    fieldEditOverlay.hidden = false;
+    fieldEditTitle.focus();
+    fieldEditTitle.select();
+    return new Promise(function (resolve) {
+      fieldEditResolve = resolve;
+    });
+  }
 
-    const raw = await ui.showPrompt("Field title:", currentLabel);
-    if (raw === null) return;
-    const label = raw.trim();
-    if (!label) return;
+  function closeFieldEditor(result) {
+    if (!fieldEditResolve) return;
+    const resolve = fieldEditResolve;
+    fieldEditResolve = null;
+    fieldEditOverlay.hidden = true;
+    resolve(result);
+  }
 
+  async function editField(key) {
+    const result = await openFieldEditor(key);
+    if (result === null || !result) return;
+    const profile = currentProfile();
+    if (!profile || !Object.prototype.hasOwnProperty.call(profile.fields, key)) return;
+    const entry = profile.fields[key];
+    const isObj = entry && typeof entry === "object" && !Array.isArray(entry);
+    const label = result.label.trim();
+    if (!label) {
+      ui.setStatus("Field title cannot be empty.");
+      return;
+    }
+    let value;
+    if (fieldEditIsArray) {
+      value = result.value.split("\n").map(item => item.trim()).filter(Boolean);
+    } else {
+      value = result.value.trim();
+      if (!value) {
+        ui.setStatus("Field value cannot be empty.");
+        return;
+      }
+    }
     if (isObj) {
       entry.label = label;
+      entry.value = value;
     } else {
-      // Legacy string entry — promote to the { value, label } format.
-      profile.fields[key] = { value: entry, label: label };
+      // Legacy scalar/array entry — promote it while retaining the edited
+      // value's scalar versus array shape.
+      profile.fields[key] = { value: value, label: label };
     }
     await saveData();
     render();
-    ui.setStatus("Field title updated.");
+    ui.setStatus("Field updated.");
   }
+
+  function fieldEditorResult() {
+    return { label: fieldEditTitle.value, value: fieldEditIsArray ? fieldEditArray.value : fieldEditScalar.value };
+  }
+
+  fieldEditSave.addEventListener("click", () => closeFieldEditor(fieldEditorResult()));
+  fieldEditCancel.addEventListener("click", () => closeFieldEditor(null));
+  fieldEditOverlay.addEventListener("click", e => {
+    if (e.target === fieldEditOverlay) closeFieldEditor(null);
+  });
+  fieldEditOverlay.addEventListener("keydown", e => {
+    if (e.key === "Escape") closeFieldEditor(null);
+  });
 
   // ---- Handlers ---------------------------------------------------------------
 

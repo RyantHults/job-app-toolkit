@@ -601,7 +601,80 @@ function skippedText(res) {
     }
   };
 
-  const JOB_DESC_ADAPTERS = [ashbyJobDescAdapter];
+  const WELLFOUND_JOB_SLUG_RE = /^[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*$/i;
+
+  // Wellfound posting pages use either /jobs/<numeric-id>-<slug> or the
+  // query-based /jobs?job_listing_slug=<numeric-id>-<slug> form.
+  const wellfoundJobDescAdapter = {
+    id: "wellfound",
+    match: function (urlStr) {
+      try {
+        const u = new URL(urlStr);
+        const host = u.hostname.toLowerCase();
+        if (host !== "wellfound.com" && host !== "www.wellfound.com") return false;
+        if (/^\/jobs\/\d+-[^/]+\/?$/.test(u.pathname)) return true;
+        if (!/^\/jobs\/?$/.test(u.pathname)) return false;
+        const slugs = u.searchParams.getAll("job_listing_slug");
+        return slugs.length === 1 && WELLFOUND_JOB_SLUG_RE.test(slugs[0]);
+      } catch (err) {
+        return false;
+      }
+    },
+    // Canonical posting URL for fetch + cache. Direct paths strip query/hash
+    // and an optional trailing slash; query paths retain only the validated
+    // job_listing_slug parameter.
+    resolveFetchUrl: function (urlStr) {
+      try {
+        const u = new URL(urlStr);
+        if (/^\/jobs\/\d+-[^/]+\/?$/.test(u.pathname)) {
+          u.hash = "";
+          u.search = "";
+          u.pathname = u.pathname.replace(/\/+$/, "") || "/";
+          return u.toString().replace(/\/$/, "") || u.origin;
+        }
+
+        if (/^\/jobs\/?$/.test(u.pathname)) {
+          const slugs = u.searchParams.getAll("job_listing_slug");
+          if (slugs.length === 1 && WELLFOUND_JOB_SLUG_RE.test(slugs[0])) {
+            u.hash = "";
+            u.pathname = "/jobs";
+            u.search = "";
+            u.searchParams.set("job_listing_slug", slugs[0]);
+            return u.toString();
+          }
+        }
+        return urlStr;
+      } catch (err) {
+        return urlStr;
+      }
+    },
+    extract: function (html) {
+      try {
+        const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+        const descriptionNode = doc.querySelector("#job-description");
+        if (descriptionNode) {
+          const description = truncateForField(
+            htmlToPlainText(descriptionNode.innerHTML || descriptionNode.textContent || ""),
+            JOB_DESC_MAX_CHARS
+          );
+          if (description) {
+            // An explicit h1 is a sufficiently strong signal for a title. Do
+            // not infer one from the URL slug or surrounding page copy.
+            const titleNode = doc.querySelector("h1");
+            const title = titleNode
+              ? htmlToPlainText(titleNode.innerHTML || titleNode.textContent || "")
+              : "";
+            return { title: title, description: description };
+          }
+        }
+      } catch (err) {
+        // Fall through to the structured-data parser.
+      }
+      return parseJobPostingFromHtml(html);
+    }
+  };
+
+  const JOB_DESC_ADAPTERS = [ashbyJobDescAdapter, wellfoundJobDescAdapter];
 
   function findJobDescAdapter(urlStr) {
     for (let i = 0; i < JOB_DESC_ADAPTERS.length; i++) {
@@ -1385,7 +1458,8 @@ function skippedText(res) {
     let text;
     let retries = 0;
     try {
-      // Optional job-posting context from a known board adapter (Ashby by URL)
+      // Optional job-posting context from a known board adapter (Ashby or
+      // Wellfound by URL)
       // or a button-gated MyGreenhouse application (any company domain /
       // iframe embed). Fail-open: an empty result leaves the prompt unchanged
       // from before. Runs inside the flow try so a lookup failure hides the

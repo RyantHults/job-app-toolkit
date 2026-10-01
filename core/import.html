@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="import.css">
+  <title>Import data — Job App Toolkit</title>
+</head>
+<body>
+  <main>
+    <h1>Import data</h1>
+    <p class="subtitle">Restore a Job App Toolkit backup. This page stays open while you choose a file.</p>
+    <label class="file-label" for="import-file">Backup file</label>
+    <input id="import-file" type="file" accept=".json,application/json,text/plain">
+    <p id="status" class="status" aria-live="polite"></p>
+  </main>
+
+  <div id="modal-overlay" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <p id="modal-message" class="modal-message"></p>
+      <input id="modal-input" class="modal-input" type="text" hidden>
+      <div class="modal-actions">
+        <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+        <button type="button" id="modal-confirm" class="btn btn-primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="ui.js"></script>
+  <script src="import.js"></script>
+</body>
+</html>

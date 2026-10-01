@@ -121,7 +121,6 @@
   const includeApiKeyEl = document.getElementById("include-api-key");
   const exportBtn = document.getElementById("export-btn");
   const importBtn = document.getElementById("import-btn");
-  const importFile = document.getElementById("import-file");
 
   function exportFileName() {
     const d = new Date();
@@ -161,48 +160,8 @@
   });
 
   importBtn.addEventListener("click", () => {
-    importFile.value = "";
-    importFile.click();
-  });
-
-  importFile.addEventListener("change", () => {
-    const file = importFile.files && importFile.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      let parsed;
-      try {
-        parsed = JSON.parse(reader.result);
-      } catch (err) {
-        ui.setStatus("Not a valid export file.");
-        importFile.value = "";
-        return;
-      }
-      const count = parsed && parsed.modules ? Object.keys(parsed.modules).length : 0;
-      ui.showConfirm(
-        "Import will replace the current configuration for " + count + " modules. Continue?"
-      ).then((confirmed) => {
-        if (!confirmed) return;
-        return browser.runtime
-          .sendMessage({ type: "jtk:importData", export: parsed })
-          .then((res) => {
-            if (res && res.ok) {
-              ui.setStatus("Imported " + (res.imported || []).length + " modules.");
-            } else {
-              ui.setStatus((res && res.error) || "Import failed.");
-            }
-          })
-          .catch(() => ui.setStatus("Import failed."));
-      }).then(() => {
-        // Reset the input in every path (parse handled above, cancel and the
-        // send flow here).
-        importFile.value = "";
-      });
-    };
-    reader.onerror = () => {
-      ui.setStatus("Could not read the file.");
-      importFile.value = "";
-    };
-    reader.readAsText(file);
+    browser.tabs
+      .create({ url: browser.runtime.getURL("core/import.html") })
+      .catch(() => ui.setStatus("Could not open import page."));
   });
 })();

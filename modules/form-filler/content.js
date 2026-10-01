@@ -937,15 +937,169 @@
     return false;
   }
 
+  // Find the best single option in a <select> for a saved scalar value.
+  // Real (non-placeholder) options only. Exact normalized match wins; if none,
+  // fall back to the closest option by token-overlap (same fuzziness used for
+  // field matching) above a threshold; below it, no option is returned so the
+  // caller skips the field rather than filling a wrong answer.
+  var SELECT_OVERLAP_THRESHOLD = 0.3;
+  function findBestSelectOption(el, value) {
+    var norm = normalize(value);
+    var best = null;
+    var bestOverlap = 0;
+    for (var i = 0; i < el.options.length; i++) {
+      var opt = el.options[i];
+      if (isPlaceholderOption(opt)) continue;
+      if (normalize(opt.value) === norm || normalize(opt.textContent) === norm) {
+        return opt; // exact match — always preferred
+      }
+      var candVal = normalize(opt.value);
+      var candText = normalize(opt.textContent);
+      var overlap = tokenOverlap(norm, candVal);
+      if (overlap < tokenOverlap(norm, candText)) overlap = tokenOverlap(norm, candText);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = opt;
+      }
+    }
+    if (best && bestOverlap >= SELECT_OVERLAP_THRESHOLD) return best;
+    return null;
+  }
+
+  // Detect whether a fillable element is the hidden text input of a custom
+  // combobox/listbox drop-down (e.g. React Select, which renders a visually
+  // hidden <input type="text"> with role="combobox" and a sibling div showing
+  // the selected option's label). Native <select> elements are always handled
+  // by their own code path, so this only applies to widget-style inputs.
+  function isComboboxInput(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    if (el.type && el.type.toLowerCase() !== "text") return false;
+    var role = el.getAttribute("role");
+    if (role === "combobox" || role === "listbox") return true;
+    if (!role) return false;
+    // Own-attribute signals first: cheaper than walking and they cannot
+    // accidentally match an unrelated wrapper.
+    var haspopup = collapseWs(el.getAttribute("aria-haspopup") || "").toLowerCase();
+    if (haspopup && haspopup !== "false") return true;
+    if (collapseWs(el.getAttribute("autocomplete") || "").toLowerCase().indexOf("list") !== -1) return true;
+    // Also catch the common class-based pattern when no explicit role. The walk
+    // MUST start at el.parentElement, never el: WIDGET_SELECTOR contains
+    // `[class*="select" i]` and react-select's hidden input carries the class
+    // `select__input`, so el.closest(".select-shell," + WIDGET_SELECTOR)
+    // self-matches the input itself and the real widget container is never
+    // reached. Same trap as getComboboxValue below.
+    for (var node = el.parentElement, depth = 0; node && depth <= 6; depth++, node = node.parentElement) {
+      if (node.matches && node.matches(".select-shell," + WIDGET_SELECTOR)) return true;
+    }
+    return false;
+  }
+
+  // Extract the visible selected value(s) from a custom combobox widget.
+  // React Select stores single selections in a .select__single-value div and
+  // multi-selections in .select__multi-value__label divs. Returns "" when no
+  // selection is displayed (placeholder state).
+  function getComboboxValue(el) {
+    if (!el) return "";
+    // Ancestor walk for the widget's display node. It MUST start at
+    // el.parentElement, never el: WIDGET_SELECTOR contains `[class*="select" i]`
+    // and the hidden react-select input's own class is `select__input`, so
+    // el.closest(".select-shell," + WIDGET_SELECTOR) matches the INPUT ITSELF
+    // (which has no children) and never reaches the real container — that
+    // self-match is the bug this whole walk exists to avoid, so don't
+    // "simplify" it back into a closest() call.
+    //
+    // Do not bail out on the first widget-ish ancestor that has no display
+    // node: `.select__input-container` matches `[class*="select" i]` but holds
+    // nothing, and the `.select__single-value` / `.select__multi-value`
+    // markup only appears further up (`.select__control` / `.select-shell`).
+    // Keep walking and stop at the first ancestor that yields a value.
+    for (var node = el.parentElement, depth = 0; node && depth <= 6; depth++, node = node.parentElement) {
+      if (!node.matches || !node.matches(".select-shell," + WIDGET_SELECTOR)) continue;
+      var found = comboboxDisplayValue(node);
+      if (found) return found;
+    }
+    // Some widgets (e.g. Greenhouse's country picker) render no display node at
+    // all and keep the answer in the input's own value / its wrapper's
+    // data-value instead. Fall back to the raw input value.
+    return collapseWs(el.value || "");
+  }
+
+  // Pull the visible selection out of one widget container. Single selections
+  // live in a .select__single-value div, multi selections in N
+  // .select__multi-value__label divs (the sibling .select__multi-value__remove
+  // is a different class and never matched). Returns "" when the container
+  // shows no selection (placeholder state) so the caller keeps walking.
+  function comboboxDisplayValue(container) {
+    if (!container || typeof container.querySelector !== "function") return "";
+    // Single-value display div (React Select / Remix CSS).
+    var single = container.querySelector(".select__single-value");
+    if (single) {
+      var text = collapseWs(single.textContent);
+      if (text) return text;
+    }
+    // Multi-value labels: join all selected labels.
+    var labels = container.querySelectorAll(".select__multi-value__label");
+    if (labels && labels.length > 0) {
+      var arr = [];
+      for (var i = 0; i < labels.length; i++) {
+        var t = collapseWs(labels[i].textContent);
+        if (t) arr.push(t);
+      }
+      if (arr.length > 0) return arr.join(", ");
+    }
+    return "";
+  }
+
+  // Drop the selection of a React-Select style widget by clicking the widget's
+  // own clear affordance ("Clear selections"). Clearing the hidden search
+  // input is useless on its own: its value is "" whether or not a selection is
+  // displayed, so setNativeValue would leave "Yes" sitting on screen while
+  // pretending to have cleared the field. Returns true when a button was
+  // clicked, false when the widget has none (caller falls back to
+  // setNativeValue). Never throws — a broken widget must not block clearing.
+  function clearComboboxWidget(el) {
+    try {
+      // .select-shell is an exact class match, so unlike WIDGET_SELECTOR it
+      // cannot self-match the `select__input` search box.
+      var scope = (el.closest && el.closest(".select-shell")) || el.parentElement;
+      if (!scope || typeof scope.querySelector !== "function") return false;
+      var btn = scope.querySelector(
+        'button[data-testid="clear-selection"], .select__clear, [aria-label="Clear selections"]'
+      );
+      if (!btn || typeof btn.click !== "function") return false;
+      btn.click();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Does this field hold real data? Placeholder prompts do not count, so
   // fields still sitting at their default state are treated as empty. A
   // checkbox is never "empty" in this sense (both checked states are
   // meaningful); callers handle checkboxes separately.
-  function fieldHasData(el) {
+   function fieldHasData(el) {
     if (el && el.tagName === "SELECT") {
-      const opt = el.selectedOptions ? el.selectedOptions[0] : null;
-      if (!opt) return false;
-      return !isPlaceholderOption(opt);
+      // Prefer the actually-selected option. If none is reported (some
+      // browsers don't populate selectedOptions when no option carries an
+      // explicit `selected` attribute), fall back to el.value against the
+      // option with that value. A select "has data" when its current option
+      // is a real (non-placeholder) choice.
+      const opt = (el.selectedOptions && el.selectedOptions[0]) || null;
+      if (opt) return !isPlaceholderOption(opt);
+      const val = String(el.value || "").trim();
+      if (val === "") return false;
+      for (const o of el.options) {
+        if (normalize(o.value) === normalize(val)) return !isPlaceholderOption(o);
+      }
+      return true;
+    }
+    // Custom combobox widget (e.g. React Select): a hidden text input whose
+    // real selected value is displayed in a sibling div. Treat the widget as
+    // "has data" when that visible value is non-empty.
+    if (isComboboxInput(el)) {
+      const val = getComboboxValue(el);
+      return String(val || "").trim() !== "";
     }
     if (!el) return false;
     const value = el.value;
@@ -977,18 +1131,11 @@
         if (changed) el.dispatchEvent(new Event("change", { bubbles: true }));
         return true;
       }
-      const norm = normalize(value);
-      let option = null;
-      for (const opt of el.options) {
-        if (normalize(opt.value) === norm || normalize(opt.textContent) === norm) {
-          option = opt;
-          break;
-        }
-      }
-      if (!option) return false; // no matching option — leave untouched
-      el.value = option.value;
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+       const option = findBestSelectOption(el, value);
+       if (!option) return false; // no good-matching option — leave untouched
+       el.value = option.value;
+       el.dispatchEvent(new Event("change", { bubbles: true }));
+       return true;
     }
     if (el.type === "checkbox") {
       let desired;
@@ -1073,15 +1220,31 @@
         const norms = new Set(value.map(normalize));
         const inSet = (text) => norms.has(normalize(text));
         for (const el of group.inputs) {
-          if (el.tagName === "SELECT") {
-            let changed = false;
-            for (const opt of el.options) {
-              const on = inSet(opt.value) || inSet(opt.textContent);
-              if (opt.selected !== on) {
-                opt.selected = on;
-                changed = true;
-              }
-            }
+           if (el.tagName === "SELECT") {
+             let changed = false;
+             for (const opt of el.options) {
+               // Exact value/text match first; fall back to a fuzzy token-
+               // overlap check against any stored value (same threshold as
+               // single-select) so "US" lands on the "United States" option.
+               let on = inSet(opt.value) || inSet(opt.textContent);
+               if (!on) {
+                 const optNormVal = normalize(opt.value);
+                 const optNormText = normalize(opt.textContent);
+                 for (const norm of norms) {
+                   if (
+                     tokenOverlap(norm, optNormVal) >= SELECT_OVERLAP_THRESHOLD ||
+                     tokenOverlap(norm, optNormText) >= SELECT_OVERLAP_THRESHOLD
+                   ) {
+                     on = true;
+                     break;
+                   }
+                 }
+               }
+               if (opt.selected !== on) {
+                 opt.selected = on;
+                 changed = true;
+               }
+             }
             if (changed) el.dispatchEvent(new Event("change", { bubbles: true }));
           } else if (el.type === "checkbox") {
             const on = inSet(el.value) || inSet(getInputLabelText(el));
@@ -1391,7 +1554,16 @@
     let fieldLabel = saveTitle || rawName || firstNonHeader || "";
     if (fieldLabel.length > 120) fieldLabel = fieldLabel.slice(0, 120) + "\u2026";
 
-    const value = el.type === "checkbox" ? String(el.checked) : el.value;
+    let value;
+    if (el.type === "checkbox") {
+      value = String(el.checked);
+    } else if (isComboboxInput(el)) {
+      // Custom combobox widget (React Select etc.): the visible selection lives
+      // in the widget's display div(s), not in el.value.
+      value = getComboboxValue(el);
+    } else {
+      value = el.value;
+    }
     return { name, value, fieldLabel, type: elementType(el) };
   }
 
@@ -2620,6 +2792,11 @@ function fillPageAll(activeProfile, force) {
     // empty strings, but setNativeValue is the exact same path fillField uses
     // for text inputs and dispatches both events).
     const el = group.inputs[0];
+    // React-Select widgets hold the visible selection in the DOM, so the native
+    // setter only wipes the hidden search box and "Yes" stays on screen. Click
+    // the widget's own clear affordance first when there is one; clearComboboxWidget
+    // is try/caught and returns false otherwise, falling through to the setter.
+    if (el && isComboboxInput(el) && clearComboboxWidget(el)) return;
     if (el && el.value !== "") {
       setNativeValue(el, "");
     }
@@ -2741,6 +2918,7 @@ function fillPageAll(activeProfile, force) {
   // Cap for Ask AI job-description context (keep in sync with background
   // JOB_DESC_MAX_CHARS). Truncates at a word boundary when possible.
   const JOB_DESC_MAX_CHARS = 10000;
+  const WELLFOUND_JOB_SLUG_RE = /^[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*$/i;
 
   function truncateJobDescriptionText(text) {
     const s = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
@@ -2749,6 +2927,42 @@ function fillPageAll(activeProfile, force) {
     const m = cut.match(/\s+\S*$/);
     if (m && m.index > 0) cut = cut.slice(0, m.index);
     return cut.trim();
+  }
+
+  // Wellfound live-DOM fast path. Keep the URL gate narrow so a generic
+  // #job-description on another page can never be reported as Wellfound.
+  function wellfoundJobDescriptionFromDom(root) {
+    const empty = { title: "", description: "" };
+    try {
+      const doc = root || document;
+      const loc = doc.location || (doc.defaultView && doc.defaultView.location);
+      const u = new URL(loc && loc.href ? loc.href : "");
+      const host = u.hostname.toLowerCase();
+      if (host !== "wellfound.com" && host !== "www.wellfound.com") return empty;
+
+      const directPath = /^\/jobs\/\d+-[^/]+\/?$/.test(u.pathname);
+      let queryPath = false;
+      if (/^\/jobs\/?$/.test(u.pathname)) {
+        const slugs = u.searchParams.getAll("job_listing_slug");
+        queryPath = slugs.length === 1 && WELLFOUND_JOB_SLUG_RE.test(slugs[0]);
+      }
+      if (!directPath && !queryPath) return empty;
+
+      const descriptionNode = doc.querySelector("#job-description");
+      if (!descriptionNode) return empty;
+      const tmp = doc.createElement("div");
+      tmp.innerHTML = descriptionNode.innerHTML || descriptionNode.textContent || "";
+      const description = truncateJobDescriptionText(tmp.textContent || "");
+      if (!description) return empty;
+
+      // An explicit h1 is a strong enough signal; do not infer a title from
+      // the URL slug or unrelated metadata.
+      const titleNode = doc.querySelector("h1");
+      const title = titleNode ? collapseWs(titleNode.textContent) : "";
+      return { title: title, description: description };
+    } catch (err) {
+      return empty;
+    }
   }
 
   // MyGreenhouse gate + extraction for Ask AI. The "Quick Apply with
@@ -3674,6 +3888,25 @@ function fillPageAll(activeProfile, force) {
           adapterId: "greenhouse",
           jobTitle: gh.title,
           jobDescription: gh.description,
+          org: gh.org,
+          jobId: gh.jobId
+        });
+      }
+      // Wellfound live-DOM fast path: prefer the rendered description before
+      // asking the background to make its credentialed fetch.
+      const wellfound = wellfoundJobDescriptionFromDom(document);
+      if (wellfound.description) {
+        aiLog(
+          message.flowId,
+          "job description (Wellfound): " + wellfound.description.length + " chars" +
+            (wellfound.title ? ' ("' + wellfound.title.slice(0, 80) + '")' : "")
+        );
+        return Promise.resolve({
+          ok: true,
+          flowId: message.flowId,
+          adapterId: "wellfound",
+          jobTitle: wellfound.title,
+          jobDescription: wellfound.description,
           org: gh.org,
           jobId: gh.jobId
         });

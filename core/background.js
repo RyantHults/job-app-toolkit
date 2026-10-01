@@ -16,11 +16,29 @@
   "use strict";
 
   const MENU_ROOT_ID = "job-app-toolkit-menu";
+  const MAX_IMPORT_FAILURES = 20;
+  const MAX_IMPORT_ERROR_LENGTH = 240;
 
   const g = window.jobAppToolkit;
   const modules = {}; // id -> registered module
 
   let lastWebTabId = null;
+
+  function safeImportErrorMessage(err) {
+    let message;
+    try {
+      message = err && typeof err.message === "string" ? err.message :
+        typeof err === "string" ? err : "Unknown import error.";
+    } catch (ignored) {
+      message = "Unknown import error.";
+    }
+    message = message.replace(/\s+/g, " ").trim();
+    if (!message) message = "Unknown import error.";
+    if (message.length > MAX_IMPORT_ERROR_LENGTH) {
+      message = message.slice(0, MAX_IMPORT_ERROR_LENGTH - 1) + "…";
+    }
+    return message;
+  }
 
   // ------------------------------------------------------------------
   // In-page toast
@@ -257,6 +275,7 @@
           return Promise.resolve({ ok: false, error: "Unsupported export format." });
         }
         const imported = [];
+        const failures = [];
         // Imports run sequentially: storage.js reads-modifies-writes the whole
         // "jobAppToolkit" key per call, so parallel writes would lose updates.
         return Object.keys(exp.modules).reduce(
@@ -274,10 +293,17 @@
                 imported.push(id);
               } catch (err) {
                 console.error("Job App Toolkit: import failed for " + id, err);
+                if (failures.length < MAX_IMPORT_FAILURES) {
+                  failures.push({ id: id, error: safeImportErrorMessage(err) });
+                }
               }
             }),
           Promise.resolve()
-        ).then(() => ({ ok: true, imported: imported }));
+        ).then(() => ({
+          ok: failures.length === 0,
+          imported: imported,
+          failures: failures
+        }));
       }
 
       default: {
