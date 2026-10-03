@@ -69,9 +69,60 @@
   // Field discovery
   // ------------------------------------------------------------------
 
+  // Is this control part of a third-party widget (reCAPTCHA) rather than a
+  // question the applicant answers? Kept deliberately NARROW: it matches only
+  // reCAPTCHA's own namespace, so a real question can never be caught by it.
+  //
+  // WHY it exists, and why isFillable's aria-hidden guard below does not cover
+  // it: on a live Greenhouse form reCAPTCHA renders
+  //
+  //   <textarea id="g-recaptcha-response-100000" name="g-recaptcha-response"
+  //             class="g-recaptcha-response" style="… display: none;"></textarea>
+  //
+  // inside <div class="grecaptcha-badge">. It is hidden by INLINE CSS, not by
+  // aria-hidden, so isFillable accepted it as a real textarea. It then became a
+  // question of its own and was reported as `Field "Powered byGreenhouse"` —
+  // because the label text next to it is reCAPTCHA's "Powered by Google"
+  // branding, which reads like a form field but is not one. Verified on the
+  // reference page: exactly ONE control matches (this textarea) and 0 of the
+  // 25 real questions do.
+  function isThirdPartyWidgetField(el) {
+    if (!el) return false;
+    const startsWith = (attr, prefix) => String(el.getAttribute(attr) || "").toLowerCase().indexOf(prefix) === 0;
+    // name="g-recaptcha-response", id="g-recaptcha-response-100000".
+    if (startsWith("name", "g-recaptcha") || startsWith("id", "g-recaptcha")) return true;
+    // class="g-recaptcha-response".
+    if (startsWith("class", "g-recaptcha")) return true;
+    // Inside div.grecaptcha-badge / .grecaptcha-logo / .grecaptcha-error.
+    if (typeof el.closest === "function") return !!el.closest('[class^="grecaptcha"], [class*=" grecaptcha"]');
+    return false;
+  }
+
   function isFillable(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
     if (el.disabled || el.readOnly) return false;
+    // aria-hidden="true" means the control is hidden from the user, so it is not
+    // a question they can answer and must never get buttons, a profile entry, or
+    // an autofill. This is load-bearing for react-Select (Greenhouse): a REQUIRED
+    // drop-down renders an extra sibling input purely to trigger native form
+    // validation --
+    //   <input required tabindex="-1" aria-hidden="true" class="...-requiredInput">
+    // It carries no `type`, so the "(type || 'text')" default below would accept
+    // it as a real text field. It then became its own question group, drew a
+    // SECOND +/- button set on the same label as the real drop-down, and that
+    // phantom button set is what you click: the save toast then read
+    // `Field "" is empty` because the hack has no name, id, or label. Only
+    // required drop-downs render it, which is why optional ones (Gender, Veteran
+    // Status, Hispanic/Latino) looked fine. Verified on Greenhouse: all 7 hacks
+    // carry aria-hidden, and 0 of the 25 real controls do.
+    //
+    // This is a DIFFERENT signal from isThirdPartyWidgetField above: that one is
+    // hidden by inline `display: none` instead, so neither guard subsumes the
+    // other and both are needed.
+    if (el.getAttribute("aria-hidden") === "true") return false;
+    // Never a question: it belongs to a third-party widget (reCAPTCHA). Checked
+    // before the tag test so the hidden textarea is rejected at the door.
+    if (isThirdPartyWidgetField(el)) return false;
     const tag = el.tagName;
     if (tag === "TEXTAREA" || tag === "SELECT") return true;
     if (tag !== "INPUT") return false;
@@ -1018,10 +1069,22 @@
       var found = comboboxDisplayValue(node);
       if (found) return found;
     }
-    // Some widgets (e.g. Greenhouse's country picker) render no display node at
-    // all and keep the answer in the input's own value / its wrapper's
-    // data-value instead. Fall back to the raw input value.
-    return collapseWs(el.value || "");
+    // No display node anywhere => nothing is selected. Deliberately NOT falling
+    // back to el.value here, which is the trap this line used to walk into.
+    //
+    // For a react-select widget the search input is a FILTER box, never a value
+    // holder: its value is whatever the user has typed to narrow the menu, and
+    // it is cleared when a selection is made. Reading it as the answer saved
+    // search text into the profile as though it were a real selection — on a
+    // Greenhouse application form that happened to be a ZIP code ("76119")
+    // captured as the answer to "Country", which no option can ever match, so
+    // the field reported itself permanently unfillable.
+    //
+    // A genuine selection always renders a display node: `.select__single-value`
+    // for single-answer, `.select__multi-value__label` for multi. If a board
+    // really does keep its value in the input, add a case for THAT widget here
+    // rather than restoring a blanket fallback.
+    return "";
   }
 
   // Pull the visible selection out of one widget container. Single selections
@@ -1074,6 +1137,826 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // Filling a React-Select widget (Greenhouse drop-downs)
+  // ------------------------------------------------------------------
+  //
+  // Greenhouse renders every drop-down as react-select: no <select>, no hidden
+  // input, no `name` attribute. The selection lives only in React state and is
+  // shown in a sibling display div, so the only way to set it is to synthesize
+  // the real user interaction: open the menu, click an option, then confirm the
+  // display node changed. Writing to the widget's hidden search box instead (the
+  // old setNativeValue path) reported a successful fill while nothing at all
+  // happened on screen — a silent lie, which is what the async fill below
+  // exists to remove.
+  //
+  // Two open react-select menus fight over react-select's outside-click
+  // handling and the loser stalls, so EVERY fill that drives a widget goes
+  // through withFillLock and fills strictly one widget at a time.
+  const COMBOBOX_MENU_TIMEOUT_MS = 2000;
+  const COMBOBOX_POLL_MS = 16;
+  // Per-escalation-step budget while OPENING the menu. The open is attempted in
+  // up to COMBOBOX_OPEN_STEPS.length steps, each followed by a poll of at most
+  // this long, so the worst case (3 x 400ms) still stays inside the
+  // COMBOBOX_MENU_TIMEOUT_MS outer bound. A single step must not be allowed to
+  // burn the whole 2s, or the focus-independent ArrowDown escape hatch would
+  // never be reached in time — which is the whole point of escalating.
+  const COMBOBOX_OPEN_STEP_MS = 400;
+
+  // ---- Re-resolving the widget instead of caching a node reference ----
+  //
+  // WHY WE NEVER HOLD A NODE ACROSS AN INTERACTION (do not "simplify" this back
+  // to a captured `el`): react-select re-renders — and can REPLACE the search
+  // input node outright — when it opens or focuses. A real click therefore
+  // updates the DOM and the user sees the menu on the NEW node, while every read
+  // through the OLD, now-detached node keeps reporting the pre-open state
+  // (`aria-expanded="false"`, no aria-controls, no listbox) forever. That is
+  // exactly what a real-browser probe saw: a real click opens the menu, every
+  // synthetic attempt reads "closed". It is ALSO indistinguishable, from the
+  // outside, from "the synthetic event simply did nothing" — so the whole fill
+  // path is written to re-resolve the input after every dispatched event, and
+  // to report whether the node's identity changed.
+  //
+  // The stable anchor is the input's own id, else its name. Both are attributes
+  // that survive a re-render (React reuses or reproduces them on the new node);
+  // the node itself does not.
+  function comboboxFieldId(el) {
+    if (!el) return "";
+    const id = String(el.id || "").trim();
+    if (id) return id;
+    return String(el.getAttribute("name") || "").trim();
+  }
+
+  // CSS.escape where the engine has it (Firefox does), with a conservative
+  // fallback. This only has to make a value safe inside an attribute-selector
+  // string, but a THROW here would take the entire re-resolution path down — and
+  // that path is the fix — so it must never throw.
+  function escapeSelectorValue(value) {
+    const s = String(value);
+    try {
+      if (typeof CSS !== "undefined" && CSS && typeof CSS.escape === "function") {
+        return CSS.escape(s);
+      }
+    } catch (err) {
+      // Fall through to the manual escape.
+    }
+    return s.replace(/["\\]/g, "\\$&");
+  }
+
+  // The widget's own search box, from a scope that certainly contains it.
+  // Combined selector because this Greenhouse build's react-select variant may
+  // omit role="combobox" and keep only the `select__input` class.
+  const COMBOBOX_INPUT_SELECTOR = 'input[role="combobox"], input.select__input';
+
+  // Re-find the CURRENT combobox input for `fieldId`, or null. Never fall back
+  // to a document-wide search for "a combobox": the form carries 10+ widgets and
+  // the page also carries intl-tel-input's hidden country picker, so a page-wide
+  // lookup could hand back a different question entirely.
+  function resolveComboboxNode(fieldId, doc) {
+    const root = doc || document;
+    if (!fieldId || !root) return null;
+    const usable = (node) =>
+      node && node.tagName === "INPUT" && isComboboxInput(node) ? node : null;
+    // (1) The input's own id/name attribute, straight off the document.
+    const direct = usable(root.getElementById ? root.getElementById(fieldId) : null);
+    if (direct) return direct;
+    // (2) Via the question's <label for="…">. The label can either wrap the
+    // widget or sit beside it inside the same react-select container, so try
+    // both directions. ".select__container, .select-shell" rather than the
+    // container class alone: a real-browser probe of this build shows
+    // select__container rendered as an UNCLASSED div, so the class may not be
+    // there at all. Both are exact class matches on this widget's own ancestors,
+    // so this can never reach the country picker (it is inside no .select-shell).
+    let label = null;
+    try {
+      label = root.querySelector('label[for="' + escapeSelectorValue(fieldId) + '"]');
+    } catch (err) {
+      label = null;
+    }
+    if (label && typeof label.querySelector === "function") {
+      const inLabel = usable(label.querySelector(COMBOBOX_INPUT_SELECTOR));
+      if (inLabel) return inLabel;
+      const container =
+        label.closest && label.closest(".select__container, .select-shell, " + WIDGET_SELECTOR);
+      const fromContainer = usable(container && container.querySelector(COMBOBOX_INPUT_SELECTOR));
+      if (fromContainer) return fromContainer;
+    }
+    return null;
+  }
+
+// The resolver every read in this subsystem goes through, bound once per fill.
+  // Two tiers: re-resolve by stable id/name first, and only if that finds
+  // nothing fall back to the captured node while it is still connected. The
+  // fallback is the pre-existing, weaker behaviour, and it is exactly the case
+  // where a React re-render can break the fill with no way to recover. A
+  // page-wide "find some combobox" is NOT an option: the form has 10+ widgets
+  // and the page has a hidden country picker.
+  function comboboxResolver(fieldId, doc, origin) {
+    const fallback = () => (origin && origin.isConnected ? origin : null);
+    if (!fieldId) return fallback;
+    return () => resolveComboboxNode(fieldId, doc) || fallback();
+  }
+
+  // Bumped by teardown(). Every in-flight widget fill compares the epoch it
+  // started with against this on each poll tick and abandons the fill when they
+  // differ, so deactivating the module (or leaving the whitelisted host) cannot
+  // leave a menu open or a half-filled field behind.
+  let fillEpoch = 0;
+  // Non-zero while a widget fill is running (Fill Page, fill this field once,
+  // undo). One number, not a stack: the lock is held for a whole top-level
+  // fill, never acquired twice.
+  let fillInFlight = 0;
+
+  // Drop the widget-menu lock. Guarded so a double release (a throw path plus a
+  // finally) can never drive the counter negative and unlock a running fill.
+  function releaseFill() {
+    if (fillInFlight > 0) fillInFlight--;
+  }
+
+  // Serialize a whole fill. Returns null when another fill already holds the
+  // lock (double-clicked "Fill Page", or Fill Page while fill-this-field is
+  // running) — the caller reports that instead of opening a second menu.
+  // Releases on resolve AND on reject, so a thrown error can never wedge Fill
+  // Page for the rest of the page's life.
+  function withFillLock(fn) {
+    if (fillInFlight > 0) return null;
+    fillInFlight++;
+    let out;
+    try {
+      out = Promise.resolve(fn());
+    } catch (err) {
+      releaseFill();
+      return Promise.resolve(false);
+    }
+    return out.then(
+      (value) => {
+        releaseFill();
+        return value;
+      },
+      (err) => {
+        releaseFill();
+        throw err;
+      }
+    );
+  }
+
+  // The clickable control for a react-select widget. Resolved by ANCESTRY ONLY.
+  // There is deliberately no document-wide querySelector fallback: a Greenhouse
+  // form carries 10+ selects, so "find the only .select__control" would happily
+  // drive whichever question happens to come first.
+  function comboboxControl(el) {
+    if (!el || typeof el.closest !== "function") return null;
+    return el.closest(".select__control");
+  }
+
+  // Construct a DOM event from the element's OWN window. A widget may live in a
+  // same-origin iframe whose document belongs to a different window than this
+  // script, and events built from the wrong window's constructor are rejected
+  // by some engines.
+  function hostEvent(el, Ctor, name, init) {
+    const view = ((el && el.ownerDocument) || document).defaultView || window;
+    const C = (view && view[Ctor]) || Ctor;
+    return new C(name, init);
+  }
+
+  // Dispatch the COMPLETE pointer gesture a real user's press-and-release produces:
+  // mousedown -> mouseup -> click, all bubbling, all cancelable, all left-button.
+  //
+  // THE FULL GESTURE IS LOAD-BEARING. Measured in a real Firefox on a live
+  // Greenhouse form, driving this very widget:
+  //
+  //   [baseline]                            aria-expanded=false menuEl=no
+  //   [A] inp.focus()                       aria-expanded=false menuEl=no
+  //   [B] mousedown+mouseup+click CONTROL   aria-expanded=TRUE  menuEl=yes
+  //   [C] mousedown+mouseup+click INPUT     aria-expanded=false menuEl=no
+  //
+  // and a single bare `mousedown` on the control, polled at 16ms for 20 ticks,
+  // NEVER opened the menu — so this is not a timing race, the bare event is
+  // genuinely inert on this build. Do NOT "simplify" this back to a single
+  // mousedown, or to a bare click: that regression has already cost several
+  // debugging cycles.
+  //
+  // The exact mechanism is not fully determined (react-select tracks
+  // userIsDragging and the `onMouseUp` that clears it lives on d4, above the
+  // control), and it does not need to be: the full sequence is measured to work.
+  //
+  // Constructed via hostEvent so the MouseEvent class comes from the widget's OWN
+  // window (a widget can live in a same-origin iframe).
+  function dispatchMouseGesture(target) {
+    if (!target || typeof target.dispatchEvent !== "function") return false;
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      target.dispatchEvent(
+        hostEvent(target, "MouseEvent", type, {
+          bubbles: true,
+          cancelable: true,
+          button: 0
+        })
+      );
+    }
+    return true;
+  }
+
+  // Ordered escalation for opening a widget's menu. The order is not arbitrary:
+  // step 1 is the PROVEN gesture on this build (a real click, as one gesture),
+  // so it must be first; step 2 is the focus-independent open path from
+  // react-select source, kept as a fallback for other builds/configurations where
+  // the control's mousedown branch does call openMenu('first'); step 3 repeats
+  // the proven gesture in case the first one raced the widget's initial render.
+  const COMBOBOX_OPEN_STEPS = [
+    "mousedown+mouseup+click",
+    "keydown ArrowDown",
+    "mousedown+mouseup+click"
+  ];
+
+  // Fire one escalation step against a FRESHLY resolved input node. Returns false
+  // when the step could not be dispatched at all (aborting the escalation).
+  // `el` must be re-resolved by the caller before every call — see
+  // resolveComboboxNode.
+  function dispatchComboboxOpenStep(el, step) {
+    try {
+      if (step === "keydown ArrowDown") {
+        // FALLBACK open path, kept because it is correct for other
+        // react-select configurations: onKeyDown switches on event.key and, for
+        // 'ArrowDown' with the menu closed, calls openMenu('first') directly, with
+        // no dependence on focus state at all.
+        //
+        // It is NOT the primary path on this build, and the reason is now
+        // measured rather than guessed: the control's mousedown branch is inert
+        // without a full gesture, and this build's openMenuOnFocus is false, so
+        // focus() opens nothing (probe [A] above).
+        //
+        // WHERE it is dispatched, per the real-browser handler dump of this
+        // Greenhouse build (React's registered-props walk up from the search
+        // input):
+        //
+        //   d0 INPUT.select__input          [onBlur, onChange, onFocus]
+        //   d3 DIV.select__control          [onMouseDown, onTouchEnd]
+        //   d4 DIV. (unclassed)             [onKeyUp, onMouseUp, onTouchEnd]
+        //   d5 DIV.select-shell             [onKeyDown]      <-- HERE
+        //   d6 DIV.select__container        []
+        //
+        // So onKeyDown lives on .select-shell. Do not retarget .select__container:
+        // d6 is an ANCESTOR of .select-shell, so a keydown dispatched there bubbles
+        // AWAY from the handler and can never open anything.
+        //
+        // bubbles: true is REQUIRED: React binds these handlers through a delegated
+        // listener on a container ancestor, so a non-bubbling keydown on a leaf
+        // never reaches it.
+        //
+        // keyCode/which are best-effort only: Firefox ignores them on a
+        // constructed KeyboardEvent (they stay 0). That is fine — react-select
+        // only reads keyCode for its `=== 229` IME guard, and 0 passes it.
+        const shell = (el.closest && el.closest(".select-shell")) || el;
+        shell.dispatchEvent(
+          hostEvent(shell, "KeyboardEvent", "keydown", {
+            key: "ArrowDown",
+            code: "ArrowDown",
+            keyCode: 40,
+            which: 40,
+            bubbles: true,
+            cancelable: true
+          })
+        );
+      } else {
+        // The proven gesture, on the CONTROL — never on the input: probe [C]
+        // shows the same full gesture dispatched at the input does NOT open the
+        // menu, because the input carries no mousedown handler at all (only
+        // onBlur/onChange/onFocus, per the registry above).
+        //
+        // The control is resolved from the FRESH input node, so a re-render
+        // mid-escalation cannot leave us poking a detached (or worse, a re-used)
+        // element.
+        //
+        // Deliberately NOT dispatched on Greenhouse's
+        // button[aria-label="Toggle flyout"]: that is a custom Greenhouse
+        // component and may not carry react-select's own handler, so the open
+        // would silently do nothing.
+        const control = comboboxControl(el);
+        if (!control) return false;
+        return dispatchMouseGesture(control);
+      }
+    } catch (err) {
+      return false;
+    }
+    return true;
+  }
+
+  // Open a widget's menu, escalating until a listbox actually appears. Takes the
+  // STABLE identifier, not a node: the input is re-resolved before every step and
+  // again on every poll tick, so a React re-render that swaps the node mid-open is
+  // invisible here instead of poisoning every later read. Resolves the listbox
+  // element (truthy) on success, false on every failure path (epoch bump,
+  // unresolvable input, nothing dispatched).
+  //
+  // focus() is NOT an opening path on this build: openMenuOnFocus is false, and a
+  // real-browser probe confirms input.focus() alone leaves aria-expanded="false"
+  // and renders no menu. Step 1 is therefore the full measured gesture, not a
+  // focus attempt.
+  //
+  // The DOM must be re-read BETWEEN steps: react-select renders the listbox a
+  // tick after the opening event, so an immediate check can miss a menu that
+  // did open. Hence each step is followed by its own short poll rather than one
+  // long poll before/after the whole sequence.
+  async function openComboboxMenu(fieldId, doc, origin, epoch) {
+    const resolve = comboboxResolver(fieldId, doc, origin);
+    for (let i = 0; i < COMBOBOX_OPEN_STEPS.length; i++) {
+      // A teardown invalidates every remaining step; stop instead of poking the
+      // page after the module has been torn down.
+      if (epoch !== fillEpoch) return false;
+      const node = resolve();
+      if (!node || !node.isConnected) return false;
+      const step = COMBOBOX_OPEN_STEPS[i];
+      if (!dispatchComboboxOpenStep(node, step)) return false;
+      const listbox = await pollCombobox(epoch, () => {
+        const live = resolve();
+        return live ? resolveComboboxListbox(live) : null;
+      }, COMBOBOX_OPEN_STEP_MS);
+      if (listbox) return listbox;
+    }
+    return false;
+  }
+
+  // Close a widget's menu by asking react-select to, never by removing DOM:
+  // react-select handles Escape in onKeyDown, which on this build lives on
+  // .select-shell (see dispatchComboboxOpenStep). Dispatched there when we can
+  // find it — bubbling from the input would work too, but a stale input would
+  // carry the event nowhere. Never throws: this runs on abort paths where
+  // something has already gone wrong, and the caller may only have a node that
+  // React already detached.
+  function closeComboboxMenu(el) {
+    try {
+      if (!el) return false;
+      const target = (el.closest && el.closest(".select-shell")) || el;
+      target.dispatchEvent(
+        hostEvent(target, "KeyboardEvent", "keydown", {
+          key: "Escape",
+          code: "Escape",
+          keyCode: 27,
+          which: 27,
+          bubbles: true,
+          cancelable: true
+        })
+      );
+    } catch (err) {
+      return false;
+    }
+    return true;
+  }
+
+  // Pick an option. react-select binds onClick on the option, but this build has
+  // already demonstrated that it ignores INCOMPLETE gestures (see
+  // dispatchMouseGesture), so we send the same complete mousedown -> mouseup ->
+  // click a real user's press on an option physically produces. That is also why
+  // the element's own .click() is gone: .click() synthesises a click with no
+  // preceding mousedown/mouseup, which is exactly the shape that failed on the
+  // control. The caller's confirmation poll remains the authority on whether the
+  // commit actually landed — this only attempts it.
+  function commitComboboxOption(opt) {
+    if (!opt) return false;
+    return dispatchMouseGesture(opt);
+  }
+
+  // Resolve THIS widget's menu, from a FRESHLY resolved input. Three tiers, in
+  // order of directness, each scoped to the widget:
+  //
+  //   (a) the input's own aria-controls -> getElementById. The id is regenerated
+  //       on every open (a multi-select closes the menu after each pick, so it
+  //       must be re-read every time), and this build may never set it at all —
+  //       a real-browser probe read `aria-controls=absent`, so tier (a) cannot be
+  //       the only tier.
+  //   (b) a [role="listbox"] inside this widget's .select-shell.
+  //   (c) react-select's own menu wrapper (.select__menu / .select__menu-list)
+  //       inside this widget's container — the only tier that survives a build
+  //       which renders the menu without a listbox role.
+  //
+  // Never resolve by proximity to the control and never with a page-wide
+  // document.querySelector('[role="listbox"]') / querySelectorAll('[role="option"]').
+  //
+  // SCOPING IS A SAFETY RULE, NOT A STYLE CHOICE. The page also carries
+  // intl-tel-input's hidden phone-country picker with 244 options
+  // (<ul id="iti-0__country-listbox" role="listbox" class="iti__country-list">
+  // inside div.iti__dropdown-content.iti__hide), which is NOT inside any
+  // .select-shell. A page-wide listbox or option lookup would reach across into
+  // that picker and click a country instead of the intended answer. Every option
+  // read stays scoped to the node returned from HERE.
+  function resolveComboboxListbox(el) {
+    if (!el || !el.isConnected) return null;
+    const doc = el.ownerDocument || document;
+    // (a)
+    const ariaControls = el.getAttribute("aria-controls");
+    if (ariaControls) {
+      const byId = doc.getElementById(ariaControls);
+      // An id resolving to a node that is not a listbox would hand callers
+      // something with no options in it; treat it as unresolved and fall
+      // through instead of reporting an empty menu.
+      if (byId && (!byId.getAttribute || byId.getAttribute("role") === "listbox")) return byId;
+    }
+    const shell = el.closest && el.closest(".select-shell");
+    // (b) Exact class match, so this cannot self-match the `select__input`
+    // search box, and the country picker is outside every .select-shell.
+    if (shell) {
+      const lb = shell.querySelector('[role="listbox"]');
+      if (lb) return lb;
+    }
+    // (c) Still scoped to this widget only. ".select__container, .select-shell"
+    // because this build renders select__container as an unclassed div (see the
+    // handler dump in dispatchComboboxOpenStep); the shell is its descendant, so
+    // the union cannot widen the scope beyond this widget.
+    const scope = (el.closest && el.closest(".select__container")) || shell;
+    if (scope) {
+      const menu = scope.querySelector(".select__menu, .select__menu-list");
+      if (menu) return menu;
+    }
+    return null;
+  }
+
+  // Mirror of findBestSelectOption for react-select options, deliberately: a
+  // Greenhouse drop-down must not fill more loosely than an iCIMS one. Same
+  // skip rules, same exact-match-wins, same tokenOverlap floor against the same
+  // SELECT_OVERLAP_THRESHOLD, same null-when-nothing-good (the caller then SKIPS
+  // rather than clicking a wrong answer).
+  //
+  // aria-disabled is the stand-in for isPlaceholderOption: react-select renders
+  // its placeholder into .select__placeholder, OUTSIDE the listbox, so it never
+  // appears as an option to click; a "Select…" entry inside the menu carries
+  // aria-disabled="true". An option with empty text is excluded for free — it
+  // can neither match exactly nor score any token overlap.
+  function findBestComboboxOption(options, value) {
+    const norm = normalize(value);
+    // An empty stored value would "exactly" match a placeholder option and
+    // select it. Never fill a wrong answer, so an empty value fills nothing.
+    if (!norm) return null;
+    let best = null;
+    let bestOverlap = 0;
+    const list = options || [];
+    for (let i = 0; i < list.length; i++) {
+      const opt = list[i];
+      // Match on textContent, never innerHTML: react-select options embed
+      // markup (a check icon, nested divs).
+      const text = normalize(collapseWs(opt.textContent || ""));
+      if (opt.getAttribute && opt.getAttribute("aria-disabled") === "true") continue;
+      if (text === norm) return opt;
+      const overlap = tokenOverlap(norm, text);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = opt;
+      }
+    }
+    if (best && bestOverlap >= SELECT_OVERLAP_THRESHOLD) return best;
+    // Dialling-code fallback. Some widgets display ONLY the code ("+1") while
+    // their options carry "United States +1", so the stored value can never
+    // match an option label by any text rule — tokenOverlap discards words
+    // under three characters, so a bare "+1" scores zero against everything.
+    // Matching the trailing "+NNN" token lets those widgets fill at all.
+    //
+    // KNOWN COST, accepted deliberately: a code is not unique to a country
+    // (+1 is shared by United States, American Samoa and Canada), so this picks
+    // the FIRST option carrying that code rather than a provably-correct one.
+    // On Greenhouse's country list the US is listed first, so a US applicant
+    // gets the right answer and a Canadian one is silently given "United
+    // States". Only reachable when nothing else matched, so a stored value that
+    // carries a country NAME still resolves by exact label and never reaches
+    // here. Requiring the explicit "+" marker keeps ordinary numeric options
+    // ("1", "1-10", "10+") out of this path.
+    const wantCode = comboboxDialCode(value);
+    if (wantCode) {
+      for (let i = 0; i < list.length; i++) {
+        const opt = list[i];
+        if (opt.getAttribute && opt.getAttribute("aria-disabled") === "true") continue;
+        const code = comboboxDialCode(opt.textContent || "");
+        if (code && code === wantCode) return opt;
+      }
+    }
+    return null;
+  }
+
+  // Extract a trailing dialling code ("United States +1" -> "+1") from a label,
+  // or null when the text does not end in one. Requires the explicit "+" so
+  // plain numbers are never mistaken for a country code.
+  function comboboxDialCode(text) {
+    const parts = collapseWs(text).split(" ");
+    const last = parts[parts.length - 1] || "";
+    return /^\+\d{1,4}$/.test(last) ? last : null;
+  }
+
+  // Is `wanted` part of the widget's visible value now? Exact for a single
+  // select, whose display string IS the picked option's text; a membership test
+  // for a multi-select, whose display string is the comma-joined list of every
+  // pick so far ("Latinx, White"). Reads through getComboboxValue, never through
+  // .select__single-value, which does not exist at all on a multi-select.
+  function comboboxShowsValue(el, wanted) {
+    const norm = normalize(wanted);
+    if (!norm) return false;
+    const shown = normalize(getComboboxValue(el));
+    if (!shown) return false;
+    return shown.indexOf(norm) !== -1;
+  }
+
+  // Poll `probe` every COMBOBOX_POLL_MS until it returns something truthy or the
+  // wall-clock deadline passes; resolves the probe's value or null. `timeoutMs`
+  // defaults to the full COMBOBOX_MENU_TIMEOUT_MS and exists only so the open
+  // escalation can give each of its steps a short slice and still get to the
+  // next one.
+  //
+  // setTimeout, NEVER requestAnimationFrame. rAF does not fire in a background
+  // tab, so an rAF poll would wait forever and wedge this MV2 event page: an
+  // unanswered fillPage message keeps the event page alive indefinitely, which
+  // is exactly the failure this poll exists to avoid. A background tab throttles
+  // setTimeout to ~1s, so a fill there is merely slower — it still terminates.
+  // The epoch check is what makes an in-flight fill abandonable.
+  function pollCombobox(epoch, probe, timeoutMs) {
+    const budget = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : COMBOBOX_MENU_TIMEOUT_MS;
+    const deadline = Date.now() + budget;
+    return new Promise(function (resolve) {
+      const tick = () => {
+        if (epoch !== fillEpoch) {
+          resolve(null);
+          return;
+        }
+        let found = null;
+        try {
+          found = probe();
+        } catch (err) {
+          found = null;
+        }
+        if (found) {
+          resolve(found);
+          return;
+        }
+        if (Date.now() >= deadline) {
+          resolve(null);
+          return;
+        }
+        setTimeout(tick, COMBOBOX_POLL_MS);
+      };
+      tick();
+    });
+  }
+
+  // ---- Multi-select widgets whose stored value is a comma-JOINED string ----
+  //
+  // TWO TRAPS THAT MAKE THIS BUG RECUR. Both are load-bearing; do not "simplify"
+  // either away.
+  //
+  // 1. THE VALUE IS A STRING, NOT AN ARRAY. react-select's hidden input is
+  //    type="text", so classifyField types the widget as a "single"-answer group;
+  //    describeGroup therefore routes to describeField, and getComboboxValue
+  //    returns the multi-value labels joined with ", ". The array branch of the
+  //    fill loop is NEVER reached for these widgets. Proven from a real Fill Page
+  //    run on field 4028769003: the menu opened, all 12 options were found, and
+  //    the fill still failed with
+  //
+  //      no option matched "Latinx, White"; available: Black/African American | …
+  //
+  //    because it was hunting for one option literally labelled "Latinx, White".
+  //
+  // 2. NEVER comma-split the stored string. Option labels contain commas
+  //    themselves — this very menu offers
+  //      Indigenous/Aboriginal (First Nations, Native American, Alaska Native,
+  //      North American Indian, Metis, Inuit)
+  //    so splitting on "," would corrupt that label and invent selections nobody
+  //    asked for. We MATCH option labels against the stored string by
+  //    containment instead, which needs no parsing at all.
+
+  // Is this widget a react-select MULTI-select? react-select's own class,
+  // scoped to THIS widget's shell. Never a page-wide query: a Greenhouse form
+  // carries 10+ widgets, and the page also has a hidden phone-country picker
+  // whose widget markup must never be mistaken for one of ours. Exact class
+  // match, so this cannot self-match the `select__input` search box.
+  function isMultiSelectCombobox(el) {
+    if (!el || typeof el.closest !== "function") return false;
+    const shell = el.closest(".select-shell");
+    if (!shell || typeof shell.querySelector !== "function") return false;
+    return !!shell.querySelector(".select__value-container--is-multi");
+  }
+
+  // Is this option already selected? Both signals are checked because react-select
+  // versions differ: aria-selected on the option, and the BEM modifier class.
+  // This matters because clicking an already-selected option in a multi-select
+  // DESELECTS it — which would silently undo the very chip we are trying to keep.
+  function comboboxOptionSelected(opt) {
+    if (!opt) return false;
+    if (opt.getAttribute && opt.getAttribute("aria-selected") === "true") return true;
+    if (opt.className != null) {
+      return String(opt.className).indexOf("select__option--is-selected") !== -1;
+    }
+    return false;
+  }
+
+  // The options this widget should end up with, for a stored value that is a
+  // comma-joined string.
+  //
+  // MATCHING RULE — containment, never parsing: an option is a target when its
+  // own normalized text is a SUBSTRING of the normalized stored value. For
+  // "Latinx, White" (normalized "latinx white") that selects `Latinx` and
+  // `White` and nothing else. normalize() folds punctuation to spaces, so a
+  // label stored as "Multiracial, Multiethnic" also matches the option
+  // "Multiracial/Multiethnic" without us knowing or caring.
+  //
+  // LONGEST-MATCH WINS: if one target's normalized text is contained in another
+  // target's, the shorter one is dropped. Otherwise a stored value of "White"
+  // would select both `White` and `Off-White` — containment alone is too greedy.
+  // Duplicate labels collapse to the first occurrence.
+  function multiComboboxTargets(options, value) {
+    const hay = normalize(collapseWs(value));
+    const found = [];
+    if (!hay) return found;
+    const list = options || [];
+    for (let i = 0; i < list.length; i++) {
+      const opt = list[i];
+      // aria-disabled is the same placeholder stand-in findBestComboboxOption uses.
+      if (opt.getAttribute && opt.getAttribute("aria-disabled") === "true") continue;
+      const label = collapseWs(opt.textContent || "");
+      const text = normalize(label);
+      if (!text) continue;
+      if (hay.indexOf(text) === -1) continue;
+      found.push({ label: label, norm: text });
+    }
+    const kept = [];
+    for (let i = 0; i < found.length; i++) {
+      const cand = found[i];
+      let shadowed = false;
+      for (let j = 0; j < found.length && !shadowed; j++) {
+        if (i === j) continue;
+        const other = found[j];
+        // Equal labels do not shadow each other; the de-dup below keeps one.
+        if (other.norm === cand.norm) continue;
+        if (other.norm.length > cand.norm.length && other.norm.indexOf(cand.norm) !== -1) shadowed = true;
+      }
+      if (shadowed) continue;
+      let dup = false;
+      for (let k = 0; k < kept.length; k++) {
+        if (kept[k].norm === cand.norm) dup = true;
+      }
+      if (!dup) kept.push(cand);
+    }
+    return kept;
+  }
+
+  // Re-find ONE option by EXACT normalized label equality, inside this widget's
+  // resolved listbox only. Deliberately not findBestComboboxOption: the labels
+  // were already resolved by multiComboboxTargets, so re-running fuzzy matching
+  // per pick could land on a different, merely-similar option. Scoped to the
+  // listbox, never page-wide (see resolveComboboxListbox).
+  function findComboboxOptionByLabel(listbox, norm) {
+    if (!listbox || !norm) return null;
+    const opts = listbox.querySelectorAll('[role="option"]');
+    for (let i = 0; i < opts.length; i++) {
+      if (normalize(collapseWs(opts[i].textContent || "")) === norm) return opts[i];
+    }
+    return null;
+  }
+
+  // Drive a react-select MULTI-select from one comma-joined string. Resolves true
+  // when every target ended up on the widget (including the case where they were
+  // all already selected), false on every abort path, never rejects, and never
+  // leaves an open menu behind.
+  //
+  // Strictly SEQUENTIAL, one menu at a time, for the same reason the rest of this
+  // file is: two open react-select menus fight over react-select's
+  // outside-click handling and the loser stalls. Never Promise.all.
+  async function fillMultiCombobox(el, value) {
+    const doc = (el && el.ownerDocument) || document;
+    const origin = el;
+    const fieldId = comboboxFieldId(el);
+    const resolve = comboboxResolver(fieldId, doc, origin);
+    // One epoch for the whole widget: a teardown mid-way (between two picks) must
+    // abandon the whole fill, not silently re-sync to the new epoch.
+    const epoch = fillEpoch;
+    const abort = () => {
+      closeComboboxMenu(resolve() || origin);
+      return false;
+    };
+    // Open the menu and return its LISTBOX (the only legal source of options).
+    const openListbox = async () => {
+      const live = await pollCombobox(epoch, resolve, COMBOBOX_OPEN_STEP_MS);
+      if (!live || !live.isConnected) return null;
+      return openComboboxMenu(fieldId, doc, origin, epoch);
+    };
+    const firstListbox = await openListbox();
+    if (!firstListbox) return abort();
+    // Strictly the resolved listbox's own options — never a page-wide
+    // querySelectorAll('[role="option"]'): the hidden phone-country picker on this
+    // page has 244 of those and is not inside any .select-shell.
+    const firstOptions = firstListbox.querySelectorAll('[role="option"]');
+    if (!firstOptions.length) return abort();
+    const targets = multiComboboxTargets(firstOptions, value);
+    if (!targets.length) {
+      // Fail rather than silently succeed: an empty target list means the widget
+      // keeps its empty/placeholder state, and returning true would leave the user
+      // believing the question was answered.
+      return abort();
+    }
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+      if (epoch !== fillEpoch) return abort();
+      // closeMenuOnSelect closes the menu after every pick, so the option nodes
+      // from the first open are STALE. Re-open and re-find by exact label.
+      const listbox = i === 0 ? firstListbox : await openListbox();
+      if (!listbox) return abort();
+      const opt = findComboboxOptionByLabel(listbox, target.norm);
+      if (!opt) return abort();
+      // Already-selected options are skipped, never clicked: in a react-select
+      // multi-select a click on a selected option DESELECTS it, which would undo
+      // the very chip we are trying to keep.
+      if (comboboxOptionSelected(opt)) continue;
+      if (!commitComboboxOption(opt)) return abort();
+      // Confirm THIS target, not the whole joined string: mid-way through the
+      // picks the widget's display holds only what has been committed so far, so
+      // checking for the full "Latinx, White" would time out by construction.
+      // comboboxShowsValue is a membership test against the comma-joined display.
+      const landed = await pollCombobox(epoch, () => comboboxShowsValue(resolve(), target.label));
+      if (!landed) return abort();
+    }
+    // Close unconditionally on the way out. A pick closes the menu itself
+    // (closeMenuOnSelect), but the all-already-selected path above never clicked
+    // anything, and a menu left open covers the part of the form the user is about
+    // to click next. Escape on an already-closed menu is a no-op.
+    closeComboboxMenu(resolve() || origin);
+    return true;
+  }
+
+  // Drive one react-select to `value` and confirm it landed. Resolves true only
+  // when the widget's own display node reports the value, false on every abort
+  // path (input unresolvable, menu never opened, no matching option, deadline,
+  // epoch bump). Never rejects, and NEVER leaves an open menu behind: an aborted
+  // menu keeps covering the part of the form the user is about to click next.
+  //
+  // "The node was replaced by a React re-render" is deliberately NOT an abort
+  // path any more: every read below goes through resolveComboboxNode, so a swap
+  // mid-fill is just a re-resolve. Only an input that never comes back (the
+  // question itself is gone) aborts.
+  //
+  // An array value is a multi-answer question: closeMenuOnSelect is true, so the
+  // menu closes after each pick and we re-open (and re-read aria-controls) once
+  // per entry. Never type into the search box — react-select renders ALL options
+  // for an empty filter, and typing would both filter the list and fire input
+  // events React treats as user search.
+  async function fillCombobox(el, value) {
+    const wanted = Array.isArray(value) ? value.slice() : [value];
+    if (!wanted.length) return false;
+    const doc = (el && el.ownerDocument) || document;
+    // Captured ONCE and used for exactly one thing: re-finding the widget after
+    // every event. It is deliberately NEVER read for state — see
+    // resolveComboboxNode for why a cached node reports the pre-open state
+    // forever once React swaps it.
+    const origin = el;
+    const fieldId = comboboxFieldId(el);
+    const resolve = comboboxResolver(fieldId, doc, origin);
+    // Multi-select widgets arrive here as ONE comma-joined STRING (see the trap
+    // notes above fillMultiCombobox), so they never reach the per-entry array loop
+    // below — which would look for a single option labelled "Latinx, White" and
+    // fail, leaving the question unanswered. Hand them to the dedicated path.
+    // Gated on a STRING value and react-select's own is-multi class, so an array
+    // value (real multiChoice groups) and a single-select widget both fall
+    // through to exactly the paths they used before.
+    if (!Array.isArray(value) && typeof value === "string" && isMultiSelectCombobox(resolve() || el)) {
+      return fillMultiCombobox(el, value);
+    }
+    for (let i = 0; i < wanted.length; i++) {
+      const epoch = fillEpoch;
+      // Start from the live node, not the captured one. Polled rather than read
+      // once because a re-render can leave the document momentarily without the
+      // input; a single miss is not a failure and must not be treated as one.
+      const live = await pollCombobox(epoch, resolve, COMBOBOX_OPEN_STEP_MS);
+      if (!live || !live.isConnected) {
+        closeComboboxMenu(origin);
+        return false;
+      }
+      const abort = () => {
+        // Close on the live node when there still is one — Escape on a detached
+        // node reaches no handler and would leave the menu covering the form.
+        closeComboboxMenu(resolve() || origin);
+        return false;
+      };
+      const listbox = await openComboboxMenu(fieldId, doc, origin, epoch);
+      if (!listbox) return abort();
+      // Strictly the resolved listbox's own options — never a page-wide
+      // querySelectorAll('[role="option"]') (see resolveComboboxListbox: the
+      // hidden phone-country picker has 244 of those).
+      const options = listbox.querySelectorAll('[role="option"]');
+      if (!options.length) {
+        // Menu open but empty is a distinct failure from "menu never opened" —
+        // it usually means react-select filtered the list (our synthetic input
+        // event counted as user search) or the widget virtualizes. Either way the
+        // widget keeps its old value, so the field counts as failed, not filled.
+        return abort();
+      }
+      const opt = findBestComboboxOption(options, wanted[i]);
+      if (!opt) return abort();
+      if (!commitComboboxOption(opt)) return abort();
+      // closeMenuOnSelect already closed the menu; the selection lands on the
+      // next React commit, which is ALSO where the input node may be replaced —
+      // so the confirmation reads through a node resolved fresh on every tick.
+      const landed = await pollCombobox(
+        epoch,
+        () => comboboxShowsValue(resolve(), wanted[i])
+      );
+      if (!landed) return abort();
+    }
+    return true;
+  }
+
   // Does this field hold real data? Placeholder prompts do not count, so
   // fields still sitting at their default state are treated as empty. A
   // checkbox is never "empty" in this sense (both checked states are
@@ -1114,7 +1997,14 @@
   // a checkbox or select means "checked/selected iff the array contains this
   // option's value or label" (used for multi-answer questions); scalar values
   // keep their historical behavior.
-  function fillField(el, value) {
+  //
+  // ASYNC because a React-Select widget has no value to assign: its selection
+  // exists only in React state and can only be set by driving the real menu
+  // interaction, so a boolean "did it work" answer is not available
+  // synchronously. The boolean this returns is now a confirmed one — callers
+  // that used to discard it may await it; nothing here reports a fill it did
+  // not see land.
+  async function fillField(el, value) {
     if (el.tagName === "SELECT") {
       if (Array.isArray(value)) {
         const norms = value.map(normalize);
@@ -1154,6 +2044,11 @@
       }
       return true;
     }
+    // Custom combobox (React Select): NEVER setNativeValue. The widget's
+    // search box holds the typed filter, not the answer, so writing to it
+    // "filled" the field while the visible selection never changed. Drive the
+    // real interaction and confirm the display node instead.
+    if (isComboboxInput(el)) return fillCombobox(el, value);
     setNativeValue(el, String(value));
     return true;
   }
@@ -1202,7 +2097,12 @@
   // options in the array are selected, everything else is deselected. Radios
   // check the one radio whose value/label matches the scalar. Single groups
   // fall through to fillField.
-  function fillGroup(group, value) {
+  //
+  // ASYNC, and its return value is a CONFIRMED boolean: true only when the
+  // value is actually visible afterwards. Radio and multiChoice groups assign
+  // control state directly, so they are true on return; a single group carries
+  // the verdict up from fillField, which may have driven a widget menu.
+  async function fillGroup(group, value) {
     if (group.kind === "radio") {
       const norm = normalize(value);
       for (const el of group.inputs) {
@@ -1213,7 +2113,7 @@
           el.dispatchEvent(new Event("change", { bubbles: true }));
         }
       }
-      return;
+      return true;
     }
     if (group.kind === "multiChoice") {
       if (Array.isArray(value)) {
@@ -1255,23 +2155,28 @@
             }
           }
         }
-        return;
+        return true;
       }
       // Scalar on a multi group: only a lone checkbox (backward-compatible
       // boolean fill) can consume it.
       if (group.inputs.length === 1 && group.inputs[0].type === "checkbox") {
-        fillField(group.inputs[0], value);
+        return fillField(group.inputs[0], value);
       }
-      return;
+      return true;
     }
-    fillField(group.inputs[0], value);
+    return fillField(group.inputs[0], value);
   }
 
   // ------------------------------------------------------------------
   // Message handlers
   // ------------------------------------------------------------------
+  //
+  // ASYNC: a react-select fill is a real UI interaction with waits in it, so
+  // this no longer resolves until every widget it opened has closed. That is
+  // what makes the counts below trustworthy — nothing is scheduled-and-forgot,
+  // so `filled` counts only values that were confirmed on screen.
 
-  function fillPage(activeProfile, doc) {
+  async function fillPage(activeProfile, doc) {
     const root = doc || document;
 
     // Page template check: if a saved template matches this page's field
@@ -1323,8 +2228,13 @@
 
     let filled = 0;
     let skipped = 0;
+    // THIRD bucket, deliberately not `skipped`: skipped means "deliberately
+    // left alone, it already has data" and is reported as "already has data: …".
+    // Filing an empty drop-down there would claim it was filled already.
+    let failed = 0;
     const matchedKeys = new Set();
     const skippedNames = [];
+    const failedNames = [];
 
     for (const m of matches) {
       const el = m.field.el;
@@ -1370,10 +2280,16 @@
         if (groupMatchesStoredState(group, target)) {
           skipped++;
           skippedNames.push(group.titleText || group.key);
-        } else {
-          fillGroup(group, target);
+        } else if (await fillGroup(group, target)) {
           filled++;
           showClearButton(group);
+        } else {
+          // The widget refused the value (menu never opened, nothing matched).
+          // Counted as matched AND failed: it matched a field, it just could
+          // not be set — reporting it as unmatched too would name the same
+          // question twice.
+          failed++;
+          failedNames.push(group.titleText || group.key);
         }
         continue;
       }
@@ -1385,21 +2301,34 @@
       // Never overwrite data. A field "has data" when it holds a real value;
       // placeholder prompts (e.g. a dropdown showing "— Make a Selection —"
       // with an internal sentinel value) do not count.
+      //
+      // Combobox widgets never reach groupMatchesStoredState, and that is NOT a
+      // gap: classifyField types every input[type=text] as "single" —
+      // react-select's hidden search box included — so discoverGroups makes it
+      // its own single-input group and isGroupQuestion is false for it. Do not
+      // "fix" this by teaching groupMatchesStoredState about react-select; that
+      // branch would be dead code. The re-run guard for singles is fieldHasData
+      // below, which is already combobox-aware through getComboboxValue, so a
+      // re-run skips a widget whose value has landed.
       if (fieldHasData(el)) {
         skipped++;
         matchedKeys.add(m.key);
         skippedNames.push(getFieldTitle(el, root) || el.name || el.id);
         continue;
       }
-      if (fillField(el, target)) {
+      if (await fillField(el, target)) {
         filled++;
         matchedKeys.add(m.key);
         showClearButton(group);
+      } else {
+        failed++;
+        matchedKeys.add(m.key);
+        failedNames.push(getFieldTitle(el, root) || el.name || el.id);
       }
     }
 
     const unmatched = entries.filter((e) => !matchedKeys.has(e.key)).length;
-    return { filled, skipped, skippedNames, unmatched, matched: matchedKeys.size, matchedKeys: Array.from(matchedKeys) };
+    return { filled, skipped, failed, skippedNames, failedNames, unmatched, matched: matchedKeys.size, matchedKeys: Array.from(matchedKeys) };
   }
 
   // Human-readable title for a field: explicit label text and any title/heading
@@ -1739,18 +2668,21 @@
 
   // Job portals render their forms in (same-origin) iframes that may not carry
   // a content script of their own (Firefox does not always inject scripts into
-  // dynamically-created frames). Run a callback against this document and every
-  // same-origin descendant iframe document, skipping frames that are already
-  // marked as injected (those are reached by the background's per-frame
-  // messaging) and any cross-origin or not-yet-loaded frame.
-  function forEachSameOriginDoc(cb, doc, force) {
+  // dynamically-created frames). Collect this document and every same-origin
+  // descendant iframe document, skipping frames that are already marked as
+  // injected (those are reached by the background's per-frame messaging) and any
+  // cross-origin or not-yet-loaded frame. Returns an ARRAY, in walk order, so a
+  // caller that must await per document can iterate it in order.
+  function collectSameOriginDocs(doc, force) {
     const root = doc || document;
+    const out = [];
+    out.push(root);
+    let frames;
     try {
-      cb(root);
+      frames = root.querySelectorAll("iframe, frame");
     } catch (err) {
-      // Carry on with descendants even if the root document failed.
+      return out;
     }
-    const frames = root.querySelectorAll("iframe, frame");
     for (const frame of frames) {
       let inner;
       try {
@@ -1766,7 +2698,23 @@
           continue;
         }
       }
-      forEachSameOriginDoc(cb, inner, force);
+      for (const inner2 of collectSameOriginDocs(inner, force)) out.push(inner2);
+    }
+    return out;
+  }
+
+  // Same walk, callback form, for every caller whose callback cannot return a
+  // promise (scanPage, teardown, collectFilledFieldsAll). Do NOT reuse it for
+  // async work: its per-document try/catch cannot catch a rejected promise, so
+  // an async callback would turn one failing document into an unhandled
+  // rejection. Async callers iterate collectSameOriginDocs and await instead.
+  function forEachSameOriginDoc(cb, doc, force) {
+    for (const d of collectSameOriginDocs(doc, force)) {
+      try {
+        cb(d);
+      } catch (err) {
+        // Carry on with the remaining documents.
+      }
     }
   }
 
@@ -1887,7 +2835,12 @@
   // template entry's value. Returns a fillPageAll-compatible result; the extra
   // templateUsed field lets fillPageAll report the template name to the caller
   // (so the background can toast "Filled from template: X").
-  function fillFromTemplate(template, root) {
+  //
+  // ASYNC because a group fill may drive a react-select menu. `filled` counts
+  // CONFIRMED fills only: this used to increment unconditionally, which would
+  // report a template fill that never happened whenever a widget refused its
+  // value.
+  async function fillFromTemplate(template, root) {
     const groups = discoverGroups(root || document);
     // Same empty-identity filter as computePageShape, so each group's position
     // here matches its identity's position in the shape.
@@ -1896,12 +2849,21 @@
       if (groupIdentity(g)) identifiable.push(g);
     }
     let filled = 0;
+    let failed = 0;
+    const failedNames = [];
     for (let i = 0; i < template.fields.length && i < identifiable.length; i++) {
-      fillGroup(identifiable[i], template.fields[i].value);
-      filled++;
+      const g = identifiable[i];
+      if (await fillGroup(g, template.fields[i].value)) {
+        filled++;
+      } else {
+        failed++;
+        failedNames.push(g.titleText || g.key);
+      }
     }
     return {
       filled: filled,
+      failed: failed,
+      failedNames: failedNames,
       skipped: 0,
       unmatched: Math.max(0, template.fields.length - identifiable.length),
       matchedKeys: template.fields.map(function (f) {
@@ -2061,32 +3023,64 @@
 // "Unmatched" counts profile entries that matched no field anywhere, so the
 // per-document tallies are merged (a wrapper page with no fields must not
 // report every profile entry as unmatched).
-function fillPageAll(activeProfile, force) {
-    const totals = { filled: 0, skipped: 0, unmatched: 0, docs: 0, skippedNames: [] };
-    const allMatchedKeys = new Set();
-    forEachSameOriginDoc(
-      (doc) => {
+  //
+  // ASYNC and STRICTLY SEQUENTIAL. fillPage opens and closes react-select menus,
+  // and two open menus fight over react-select's outside-click handling, so the
+  // loser stalls until its deadline. Never turn this loop into a Promise.all:
+  // that would trade a working fill for a timed-out one. The whole walk runs
+  // under the widget-menu lock (Fill Page double-clicked would otherwise mean
+  // two concurrent fills).
+  async function fillPageAll(activeProfile, force) {
+    const run = async () => {
+      const totals = {
+        filled: 0,
+        skipped: 0,
+        failed: 0,
+        unmatched: 0,
+        docs: 0,
+        skippedNames: [],
+        failedNames: []
+      };
+      const allMatchedKeys = new Set();
+      for (const doc of collectSameOriginDocs(undefined, force)) {
         totals.docs++;
-        const r = fillPage(activeProfile, doc);
+        const r = await fillPage(activeProfile, doc);
         totals.filled += r.filled;
         totals.skipped += r.skipped;
+        totals.failed += r.failed || 0;
         if (Array.isArray(r.skippedNames)) totals.skippedNames.push(...r.skippedNames);
+        if (Array.isArray(r.failedNames)) totals.failedNames.push(...r.failedNames);
         if (Array.isArray(r.matchedKeys)) for (const key of r.matchedKeys) allMatchedKeys.add(key);
         // A template match replaces the whole page's fill — surface it to the
         // caller (the background toasts "Filled from template: X").
         if (r.templateUsed) totals.templateUsed = r.templateUsed;
-      },
-      undefined,
-      force
-    );
-    const profile = activeProfile && typeof activeProfile === "object" ? activeProfile : {};
-    const fields =
-      profile.fields && typeof profile.fields === "object" ? profile.fields : {};
-    const totalEntries = buildMatchEntries(fields).length;
-    totals.matchedKeys = Array.from(allMatchedKeys);
-    totals.totalEntries = totalEntries;
-    totals.unmatched = Math.max(0, totalEntries - allMatchedKeys.size);
-    return totals;
+      }
+      const profile = activeProfile && typeof activeProfile === "object" ? activeProfile : {};
+      const fields =
+        profile.fields && typeof profile.fields === "object" ? profile.fields : {};
+      const totalEntries = buildMatchEntries(fields).length;
+      totals.matchedKeys = Array.from(allMatchedKeys);
+      totals.totalEntries = totalEntries;
+      totals.unmatched = Math.max(0, totalEntries - allMatchedKeys.size);
+      return totals;
+    };
+    const locked = withFillLock(run);
+    // Another fill is already driving widgets. Report nothing filled rather
+    // than opening a second menu and losing the race; `busy` is informational
+    // only (the toast counts come from the other, still-running fill).
+    if (!locked) {
+      return {
+        filled: 0,
+        skipped: 0,
+        failed: 0,
+        unmatched: 0,
+        docs: 0,
+        skippedNames: [],
+        failedNames: [],
+        busy: true
+      };
+    }
+    return locked;
   }
 
   // ------------------------------------------------------------------
@@ -2346,46 +3340,62 @@ function fillPageAll(activeProfile, force) {
   // active profile. No whitelist interaction here — that is the background's
   // call, and it deliberately skips it for this action. Returns
   // { ok, key, label } on success or { ok: false, error } when the field is
-  // gone, the question is unrecognized, or nothing matches.
-  function fillFieldOnceAction(profileFields, targetElementId) {
-    const el = resolveFieldElement(targetElementId);
-    if (!el) {
-      return { ok: false, error: "No fillable field at the right-clicked element." };
+  // gone, the question is unrecognized, a fill is already running, or nothing
+  // matches. ASYNC because the fill may drive a react-select menu, so the
+  // success it reports is one it watched land.
+  async function fillFieldOnceAction(profileFields, targetElementId) {
+    // Refuse rather than open a second menu: another fill is already driving
+    // widgets on this page and the two would fight over outside-click handling.
+    if (fillInFlight > 0) {
+      return { ok: false, error: "Already filling\u2026" };
     }
-    const root = el.ownerDocument || document;
-    const groups = discoverGroups(root);
-    let group = null;
-    for (const g of groups) {
-      if (g.inputs.indexOf(el) !== -1) {
-        group = g;
-        break;
+    // Held for the whole fill, released in finally so a thrown error cannot
+    // leave Fill Page permanently locked.
+    fillInFlight++;
+    try {
+      const el = resolveFieldElement(targetElementId);
+      if (!el) {
+        return { ok: false, error: "No fillable field at the right-clicked element." };
       }
-    }
-    if (!group) {
-      return { ok: false, error: "Could not identify the question for this field." };
-    }
-    const entries = buildMatchEntries(profileFields || {});
-    const matches = matchFields(entries, [
-      // The first input, not the anchor: a multiChoice anchor is the question
-      // title element, which would defeat the type-compatibility check.
-      { el: group.inputs[0], candidates: groupCandidates(group) }
-    ]);
-    if (!matches.length) {
-      const display =
+      const root = el.ownerDocument || document;
+      const groups = discoverGroups(root);
+      let group = null;
+      for (const g of groups) {
+        if (g.inputs.indexOf(el) !== -1) {
+          group = g;
+          break;
+        }
+      }
+      if (!group) {
+        return { ok: false, error: "Could not identify the question for this field." };
+      }
+      const entries = buildMatchEntries(profileFields || {});
+      const matches = matchFields(entries, [
+        // The first input, not the anchor: a multiChoice anchor is the question
+        // title element, which would defeat the type-compatibility check.
+        { el: group.inputs[0], candidates: groupCandidates(group) }
+      ]);
+      if (!matches.length) {
+        const display =
+          group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+        return { ok: false, error: 'No saved value matches "' + display + '".' };
+      }
+      if (isExcluded(matches[0].key, group)) {
+        const display =
+          group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
+        return { ok: false, error: 'Skipped — "' + display + '" was marked as incorrect.' };
+      }
+      // Unconditional override, same as the in-page up-arrow button.
+      const label =
         group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
-      return { ok: false, error: 'No saved value matches "' + display + '".' };
+      if (!(await fillGroup(group, matches[0].entry.value))) {
+        return { ok: false, error: 'Could not select "' + label + '".' };
+      }
+      showClearButton(group);
+      return { ok: true, key: matches[0].key, label: label };
+    } finally {
+      releaseFill();
     }
-    if (isExcluded(matches[0].key, group)) {
-      const display =
-        group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
-      return { ok: false, error: 'Skipped — "' + display + '" was marked as incorrect.' };
-    }
-    // Unconditional override, same as the in-page up-arrow button.
-    fillGroup(group, matches[0].entry.value);
-    showClearButton(group);
-    const label =
-      group.titleText || group.key || group.inputs[0].name || group.inputs[0].id;
-    return { ok: true, key: matches[0].key, label: label };
   }
 
   // Build an inline SVG icon in the host document. Must use createElementNS —
@@ -2501,6 +3511,11 @@ function fillPageAll(activeProfile, force) {
   // override, matching today's single-field semantics): arrays select exactly
   // the stored options, radio scalars check the matching radio, singles use
   // fillField. No stored entry → dim + toast as before.
+  //
+  // ASYNC (a group fill may drive a react-select menu) but deliberately NOT
+  // declared async: this runs from a click listener, and an async function's
+  // rejection would be an unhandled rejection with nobody to catch it. Chain
+  // .then with an explicit rejection handler instead.
   function onFillClick(e, group) {
     e.preventDefault();
     e.stopPropagation();
@@ -2521,15 +3536,32 @@ function fillPageAll(activeProfile, force) {
       if (entry) entry.fillBtn.classList.add("jtk-ff-dim");
       return;
     }
+    if (fillInFlight > 0) {
+      toast("Already filling\u2026");
+      return;
+    }
     // Deliberate unconditional overwrite (no isFilled guard): the per-question
     // fill is an explicit override, unlike fill-page. No toast on success —
     // the visible value change is the feedback.
-    fillGroup(group, match.entry.value);
-    showClearButton(group);
-    if (entry) {
-      entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
-      entry.fillBtn.classList.remove("jtk-ff-dim");
+    const done = (ok) => {
+      if (!ok) {
+        // The widget refused the value. Silence here is what made this bug
+        // invisible in the first place.
+        toast('Could not select "' + display + '".');
+        return;
+      }
+      showClearButton(group);
+      if (entry) {
+        entry.fillBtn.title = 'Fill from profile: "' + match.key + '"';
+        entry.fillBtn.classList.remove("jtk-ff-dim");
+      }
+    };
+    const locked = withFillLock(() => fillGroup(group, match.entry.value));
+    if (!locked) {
+      toast("Already filling\u2026");
+      return;
     }
+    locked.then(done, () => done(false));
   }
 
   // Wrappers are tracked per question GROUP (via its anchor element — the
@@ -2653,8 +3685,19 @@ function fillPageAll(activeProfile, force) {
       titleEl.parentNode.insertBefore(wrapper, titleEl.nextSibling);
     } else {
       const first = group.inputs[0];
-      const parent = first.parentNode;
-      if (parent) parent.insertBefore(wrapper, first.nextSibling);
+      // Anchor OUTSIDE the widget. For a react-select the first input's parent
+      // is .select__input-container, which sits inside .select__control, so the
+      // old anchor injected a <span> into the control's flex row — perturbing
+      // the widget's layout and triggering react-select's width recalculation
+      // while its menu is open. Insert after .select__control (or
+      // .select-shell) instead so the wrapper is a sibling of the widget.
+      const widget =
+        typeof first.closest === "function"
+          ? first.closest(".select__control, .select-shell")
+          : null;
+      const ref = widget || first;
+      const parent = ref.parentNode;
+      if (parent) parent.insertBefore(wrapper, ref.nextSibling);
     }
 
     // Same negative-top centering as the button pair (positionButtons).
@@ -2707,6 +3750,17 @@ function fillPageAll(activeProfile, force) {
   function onClearClick(e, group) {
     e.preventDefault();
     e.stopPropagation();
+    // Self-healing guard, and it must come first. A react-select's visible
+    // selection lives in a display node that clearing never touches (the
+    // widget's own clear button is the only thing that removes it), so a widget
+    // whose menu was never opened looks cleared while still showing "Yes". If
+    // we went on to record a global exclusion here, the layer would blacklist
+    // the field forever on the strength of a value the user can still see.
+    const firstInput = group.inputs[0];
+    if (firstInput && isComboboxInput(firstInput) && !getComboboxValue(firstInput)) {
+      removeClearButton(group);
+      return;
+    }
     const match = findProfileMatch(group);
     if (!match) {
       removeClearButton(group);
@@ -2805,15 +3859,27 @@ function fillPageAll(activeProfile, force) {
   // Undo a wrong-autofill correction: restore the cleared value and drop the
   // exclusion (the background removes the stored record). No-op when the undo
   // buffer has no entry (expired, or the message arrived without a click).
-  function handleUndoExclusion(message) {
+  // ASYNC because the restore may drive a react-select menu — and a restore that
+  // did not land must NOT report success, or the user believes the exclusion is
+  // gone and the field is back when neither is true.
+  async function handleUndoExclusion(message) {
     const key = compositeKey(message.profileKey, message.fieldNorms);
     const entry = undoBuffer.get(key);
     if (entry && entry.group && entry.group.inputs[0] && entry.group.inputs[0].isConnected) {
-      fillGroup(entry.group, entry.value);
+      const group = entry.group;
+      const label = group.titleText || group.key || "this field";
+      // Drop the buffer entry either way: holding a group whose nodes a React
+      // re-render may have replaced only produces a second, equally broken
+      // retry.
       undoBuffer.delete(key);
-      toast('Undid — this field can autofill again.');
-      const btnEntry = buttonMap.get(entry.group.anchor);
-      if (btnEntry) updateButtonState(btnEntry, entry.group);
+      const locked = withFillLock(() => fillGroup(group, entry.value));
+      if (locked && (await locked)) {
+        toast('Undid — this field can autofill again.');
+        const btnEntry = buttonMap.get(group.anchor);
+        if (btnEntry) updateButtonState(btnEntry, group);
+      } else {
+        toast('Could not restore "' + label + '" — fill it in again.');
+      }
     }
     return { ok: true };
   }
@@ -3230,6 +4296,11 @@ function fillPageAll(activeProfile, force) {
   }
 
   function teardown() {
+    // Abort every in-flight widget fill: each poll tick compares the epoch it
+    // started with against this one and bails, closing any menu it left open.
+    // Without this, deactivating the module mid-fill leaves an invisible
+    // dropdown covering the form.
+    fillEpoch++;
     removeAlreadyAppliedWarning();
     if (observer) {
       observer.disconnect();

@@ -230,7 +230,7 @@
 // messaging may not have reached them).
 async function fillPageAcrossFrames(tab, fields) {
     const frameIds = await frameIdsOf(tab);
-    const totals = { filled: 0, skipped: 0, unmatched: 0, skippedNames: [] };
+    const totals = { filled: 0, skipped: 0, failed: 0, unmatched: 0, skippedNames: [], failedNames: [] };
     const matchedKeys = new Set();
     let totalEntries = 0;
     let anyResponded = false;
@@ -247,9 +247,15 @@ async function fillPageAcrossFrames(tab, fields) {
     const absorb = (res) => {
       totals.filled += res.filled || 0;
       totals.skipped += res.skipped || 0;
+      // Fields that matched but could not be set (a custom drop-down that
+      // refused its value). Their own bucket, never `skipped`: skipped is
+      // rendered as "already has data: …", which would be a lie about an empty
+      // field. Absent from older content scripts, hence the || 0.
+      totals.failed += res.failed || 0;
       totalEntries = Math.max(totalEntries, res.totalEntries || 0);
       if (Array.isArray(res.matchedKeys)) for (const key of res.matchedKeys) matchedKeys.add(key);
       if (Array.isArray(res.skippedNames)) totals.skippedNames.push(...res.skippedNames);
+      if (Array.isArray(res.failedNames)) totals.failedNames.push(...res.failedNames);
     };
 
     for (const frameId of frameIds) {
@@ -344,6 +350,14 @@ function skippedText(res) {
       const names = res.skippedNames.slice(0, 5).join(", ");
       const more = res.skippedNames.length > 5 ? ", \u2026" : "";
       msg += " (already has data: " + names + more + ")";
+    }
+    // Fields that matched but could not be set (a custom drop-down that
+    // refused its value). Purely additive: with no failures the wording above is
+    // byte-identical to what it always was.
+    if (res.failed > 0 && Array.isArray(res.failedNames) && res.failedNames.length) {
+      const names = res.failedNames.slice(0, 5).join(", ");
+      const more = res.failedNames.length > 5 ? ", \u2026" : "";
+      msg += " (couldn't set " + res.failed + ": " + names + more + ")";
     }
     msg += ".";
     return msg;
